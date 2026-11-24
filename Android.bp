@@ -1,0 +1,37 @@
+// Letakkan folder proyek ini di: packages/apps/A21sFMRadio/
+// Lalu tambahkan "A21sFMRadio" ke PRODUCT_PACKAGES di device/samsung/a21s/device.mk
+
+cc_library_shared {
+    name: "liba21s_fm_jni",
+    srcs: ["app/src/main/cpp/fm_tuner_jni.cpp"],
+    shared_libs: [
+        "liblog",
+        "libdl",
+    ],
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    vendor_available: false,
+}
+
+android_app {
+    name: "A21sFMRadio",
+    srcs: ["app/src/main/java/**/*.kt"],
+    manifest: "app/src/main/AndroidManifest.xml",
+    platform_apis: true,
+    privileged: true,
+    certificate: "platform",
+    jni_libs: ["liba21s_fm_jni"],
+    static_libs: [
+        "androidx.core_core-ktx",
+        "androidx.activity_activity-compose",
+        "androidx.compose.material3_material3",
+        "androidx.compose.ui_ui",
+        "kotlinx-coroutines-android",
+    ],
+    optimize: {
+        enabled: false,
+    },
+}
