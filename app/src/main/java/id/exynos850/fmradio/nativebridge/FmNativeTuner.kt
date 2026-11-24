@@ -169,6 +169,95 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
 
     fun getDiagnosticReport(): String = nativeGetDiagnosticReport()
 
+    fun detectRootFmPcm(): Pair<Int, Int>? {
+        if (!usingRootDaemon) return null
+        val parts = rootCommand("DETECT_FM_PCM").split(" ")
+        if (parts.getOrNull(0) == "OK") {
+            val card = parts.getOrNull(1)?.toIntOrNull()
+            val dev = parts.getOrNull(2)?.toIntOrNull()
+            if (card != null && dev != null) return card to dev
+        }
+        return null
+    }
+
+    suspend fun getRootAudioDiagnostic(): String = withContext(Dispatchers.IO) {
+        runCatching {
+            val script = """
+                echo "=== /dev/radio* ==="
+                ls -lZ /dev/radio* /dev/fm* 2>&1 || true
+                echo "=== /proc/asound/pcm ==="
+                cat /proc/asound/pcm 2>&1 || true
+                echo "=== audio_policy & mixer FM ==="
+                grep -inE "fm|radio" /vendor/etc/*mixer* /vendor/etc/audio_policy* 2>/dev/null | head -n 40 || true
+                if command -v tinymix >/dev/null 2>&1; then
+                  echo "=== tinymix FM ==="
+                  tinymix 2>/dev/null | grep -iE "fm|radio" | head -n 25 || true
+                fi
+            """.trimIndent()
+            val proc = ProcessBuilder("su", "-c", script)
+                .redirectErrorStream(true)
+                .start()
+            val out = proc.inputStream.bufferedReader().readText().trim()
+            proc.waitFor()
+            out.ifBlank { "Tidak ada output diagnostik root." }
+        }.getOrElse { ex ->
+            "Gagal membaca diagnostik root: ${ex.message}"
+        }
+    }
+
+    suspend fun installKsuPrivAppModule(apkSourcePath: String): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        if (apkSourcePath.isBlank()) {
+            return@withContext false to "Path APK tidak ditemukan."
+        }
+        runCatching {
+            val modDir = "/data/adb/modules/a21s_fm_privapp"
+            val privAppDir = "$modDir/system/priv-app/A21sFMRadio"
+            val permDir = "$modDir/system/etc/permissions"
+            val script = """
+                mkdir -p "$privAppDir/lib/arm64" "$permDir"
+                cp -f "$apkSourcePath" "$privAppDir/A21sFMRadio.apk"
+                chmod 0644 "$privAppDir/A21sFMRadio.apk"
+                if [ -d "$nativeLibDir" ]; then
+                  cp -f "$nativeLibDir"/*.so "$privAppDir/lib/arm64/" 2>/dev/null || true
+                  chmod 0755 "$privAppDir/lib/arm64"/*.so 2>/dev/null || true
+                fi
+                cat << 'EOF' > "$modDir/module.prop"
+id=a21s_fm_privapp
+name=A21s FM Radio Priv-App
+version=v1.0
+versionCode=1
+author=exynos850
+description=Memberikan izin system priv-app CAPTURE_AUDIO_OUTPUT dan ACCESS_FM_RADIO untuk A21s FM Radio di LineageOS 22.2
+EOF
+                cat << 'EOF' > "$permDir/privapp-permissions-id.exynos850.fmradio.xml"
+<?xml version="1.0" encoding="utf-8"?>
+<permissions>
+    <privapp-permissions package="id.exynos850.fmradio">
+        <permission name="android.permission.ACCESS_FM_RADIO" />
+        <permission name="android.permission.CAPTURE_AUDIO_OUTPUT" />
+        <permission name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    </privapp-permissions>
+</permissions>
+EOF
+                chmod 0644 "$modDir/module.prop" "$permDir/privapp-permissions-id.exynos850.fmradio.xml"
+                echo "MODUL_OK"
+            """.trimIndent()
+            val proc = ProcessBuilder("su", "-c", script)
+                .redirectErrorStream(true)
+                .start()
+            val out = proc.inputStream.bufferedReader().readText().trim()
+            val code = proc.waitFor()
+            val ok = code == 0 && out.contains("MODUL_OK")
+            ok to if (ok) {
+                "Modul KernelSU/Magisk berhasil dibuat di $modDir. Silakan REBOOT perangkat agar izin CAPTURE_AUDIO_OUTPUT (AudioTrack FM) aktif."
+            } else {
+                "Gagal membuat modul Priv-App: $out"
+            }
+        }.getOrElse { ex ->
+            false to "Gagal menjalankan su untuk modul Priv-App: ${ex.message}"
+        }
+    }
+
     suspend fun tryUnlockViaRoot(): Pair<Boolean, String> = withContext(Dispatchers.IO) {
         if (openViaRootDaemon()) {
             return@withContext true to "Berhasil membuka /dev/radio0 via Root Daemon (KernelSU/Magisk)."

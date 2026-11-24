@@ -121,6 +121,7 @@ class MainActivity : ComponentActivity() {
         LaunchedEffect(isPlaying) {
             if (isPlaying) {
                 tunerError = null
+                diagnosticReport = null
                 if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO)
                     != PackageManager.PERMISSION_GRANTED
                 ) {
@@ -129,7 +130,8 @@ class MainActivity : ComponentActivity() {
                 if (fmTuner.open(allowRootFallback = true)) {
                     isRootActive = fmTuner.isUsingRootMode()
                     fmTuner.tuneManual(freqKhz)
-                    audioEngine.startAudioStream(lifecycleScope) { err ->
+                    val rootFmPcm = fmTuner.detectRootFmPcm()
+                    audioEngine.startAudioStream(lifecycleScope, rootFmPcm) { err ->
                         tunerError = err
                     }
                     while (isActive && isPlaying) {
@@ -208,7 +210,7 @@ class MainActivity : ComponentActivity() {
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         Text(
-                            text = "Diagnostik Hardware FM",
+                            text = if (isRootActive) "Status Audio FM (Tuner Aktif)" else "Diagnostik Hardware FM",
                             style = MaterialTheme.typography.titleSmall,
                             fontWeight = FontWeight.SemiBold,
                             color = MaterialTheme.colorScheme.primary
@@ -251,13 +253,41 @@ class MainActivity : ComponentActivity() {
                                     onClick = {
                                         lifecycleScope.launch {
                                             val (ok, log) = fmTuner.tryUnlockViaRoot()
-                                            diagnosticReport = log + "\n" + fmTuner.getDiagnosticReport()
-                                            if (ok) isPlaying = true
+                                            if (ok) {
+                                                diagnosticReport = null
+                                                isPlaying = true
+                                            } else {
+                                                diagnosticReport = log + "\n" + fmTuner.getDiagnosticReport()
+                                            }
                                         }
                                     },
                                     shape = RoundedCornerShape(18.dp)
                                 ) {
                                     Text("Coba Root (KSU)", maxLines = 1, softWrap = false)
+                                }
+                            } else {
+                                Button(
+                                    onClick = {
+                                        lifecycleScope.launch {
+                                            val (_, msg) = fmTuner.installKsuPrivAppModule(applicationInfo.sourceDir)
+                                            diagnosticReport = msg
+                                        }
+                                    },
+                                    shape = RoundedCornerShape(18.dp),
+                                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+                                ) {
+                                    Text("Pasang Priv-App (KSU)", maxLines = 1, softWrap = false, fontSize = 12.sp)
+                                }
+                                FilledTonalButton(
+                                    onClick = {
+                                        lifecycleScope.launch {
+                                            diagnosticReport = fmTuner.getRootAudioDiagnostic()
+                                        }
+                                    },
+                                    shape = RoundedCornerShape(18.dp),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                                ) {
+                                    Text("Cek Audio HAL", maxLines = 1, softWrap = false, fontSize = 12.sp)
                                 }
                             }
                             TextButton(onClick = { tunerError = null }) {

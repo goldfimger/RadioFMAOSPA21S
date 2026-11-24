@@ -133,6 +133,35 @@ int main() {
                 ioctl(gFd, VIDIOC_S_CTRL, &ctrl);
             }
             std::cout << "OK" << std::endl;
+        } else if (cmd == "DETECT_FM_PCM") {
+            FILE* fp = fopen("/proc/asound/pcm", "r");
+            if (!fp) {
+                std::cout << "NONE" << std::endl;
+                continue;
+            }
+            char buf[512];
+            int foundCard = -1;
+            int foundDev = -1;
+            while (fgets(buf, sizeof(buf), fp)) {
+                std::string s(buf);
+                std::string lower = s;
+                for (char& ch : lower) ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+                if (lower.find("capture") != std::string::npos &&
+                    (lower.find("fm") != std::string::npos || lower.find("radio") != std::string::npos)) {
+                    int c = -1, d = -1;
+                    if (sscanf(buf, "%d-%d:", &c, &d) == 2) {
+                        foundCard = c;
+                        foundDev = d;
+                        break;
+                    }
+                }
+            }
+            fclose(fp);
+            if (foundCard >= 0) {
+                std::cout << "OK " << foundCard << " " << foundDev << std::endl;
+            } else {
+                std::cout << "NONE" << std::endl;
+            }
         } else if (cmd == "CLOSE") {
             if (gFd >= 0) {
                 close(gFd);

@@ -27,6 +27,7 @@ class FmAudioTrackEngine(private val context: Context) {
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
+    private var tinycapProc: Process? = null
     private var streamJob: Job? = null
     private var currentVolume = 0.85f
     private var isSpeakerForced = false
@@ -59,7 +60,11 @@ class FmAudioTrackEngine(private val context: Context) {
     }
 
     @SuppressLint("MissingPermission")
-    fun startAudioStream(scope: CoroutineScope, onError: (String) -> Unit) {
+    fun startAudioStream(
+        scope: CoroutineScope,
+        rootFmPcm: Pair<Int, Int>? = null,
+        onError: (String) -> Unit
+    ) {
         if (streamJob?.isActive == true) return
 
         val minRecordBuf = AudioRecord.getMinBufferSize(
@@ -96,37 +101,96 @@ class FmAudioTrackEngine(private val context: Context) {
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
 
-            audioRecord = AudioRecord(
-                AUDIO_SOURCE_RADIO_TUNER,
-                SAMPLE_RATE,
-                AudioFormat.CHANNEL_IN_STEREO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                bufferSize
-            )
+            audioRecord = runCatching {
+                AudioRecord(
+                    AUDIO_SOURCE_RADIO_TUNER,
+                    SAMPLE_RATE,
+                    AudioFormat.CHANNEL_IN_STEREO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    bufferSize
+                )
+            }.getOrNull()
 
-            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                // Tetap aktifkan routing HAL FM untuk perangkat yang memutar audio tuner langsung di codec
-                runCatching { audioManager.setParameters("fm_mode=on") }
-                releaseAudioHandles()
-                onError("Tuner /dev/radio0 aktif, tetapi AudioRecord(RADIO_TUNER) ditolak sistem (memerlukan izin CAPTURE_AUDIO_OUTPUT / priv-app LineageOS). Gunakan Android.bp di /system/priv-app atau routing HAL codec.")
+            if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
+                applyRouting()
+                runCatching {
+                    audioManager.setParameters("fm_mode=on")
+                    audioManager.setParameters("fm_radio_mute=0")
+                }
+                audioTrack?.setVolume(currentVolume)
+                audioTrack?.play()
+                audioRecord?.startRecording()
+
+                streamJob = scope.launch(Dispatchers.IO) {
+                    val pcmBuffer = ShortArray(2048)
+                    while (isActive) {
+                        val readCount = audioRecord?.read(pcmBuffer, 0, pcmBuffer.size) ?: -1
+                        if (readCount > 0) {
+                            audioTrack?.write(pcmBuffer, 0, readCount, AudioTrack.WRITE_BLOCKING)
+                        }
+                    }
+                }
                 return
             }
 
-            applyRouting()
-            runCatching { audioManager.setParameters("fm_mode=on") }
-            audioTrack?.setVolume(currentVolume)
-            audioTrack?.play()
-            audioRecord?.startRecording()
+            // Fallback Root ALSA PCM (tinycap -> AudioTrack) jika perangkat mengekspos node PCM FM di /proc/asound/pcm
+            if (rootFmPcm != null) {
+                val (card, dev) = rootFmPcm
+                val proc = runCatching {
+                    ProcessBuilder(
+                        "su", "-c",
+                        "if command -v tinycap >/dev/null 2>&1; then exec tinycap - -D $card -d $dev -r $SAMPLE_RATE -c 2 -b 16; fi"
+                    ).start()
+                }.getOrNull()
 
-            streamJob = scope.launch(Dispatchers.IO) {
-                val pcmBuffer = ShortArray(2048)
-                while (isActive) {
-                    val readCount = audioRecord?.read(pcmBuffer, 0, pcmBuffer.size) ?: -1
-                    if (readCount > 0) {
-                        audioTrack?.write(pcmBuffer, 0, readCount, AudioTrack.WRITE_BLOCKING)
+                if (proc != null) {
+                    tinycapProc = proc
+                    applyRouting()
+                    runCatching { audioManager.setParameters("fm_mode=on") }
+                    audioTrack?.setVolume(currentVolume)
+                    audioTrack?.play()
+
+                    streamJob = scope.launch(Dispatchers.IO) {
+                        val byteBuf = ByteArray(4096)
+                        val input = proc.inputStream
+                        var firstChunk = true
+                        var totalWritten = 0L
+                        while (isActive) {
+                            val readBytes = input.read(byteBuf)
+                            if (readBytes <= 0) break
+                            var offset = 0
+                            var len = readBytes
+                            if (firstChunk && readBytes > 44 &&
+                                byteBuf[0] == 'R'.code.toByte() &&
+                                byteBuf[1] == 'I'.code.toByte() &&
+                                byteBuf[2] == 'F'.code.toByte() &&
+                                byteBuf[3] == 'F'.code.toByte()
+                            ) {
+                                offset = 44
+                                len = readBytes - 44
+                            }
+                            firstChunk = false
+                            if (len > 0) {
+                                audioTrack?.write(byteBuf, offset, len, AudioTrack.WRITE_BLOCKING)
+                                totalWritten += len
+                            }
+                        }
+                        if (isActive && totalWritten == 0L) {
+                            releaseAudioHandles()
+                            onError("Tuner /dev/radio0 aktif, tetapi stream ALSA FM belum tersedia. Pasang modul Priv-App KernelSU lalu reboot, atau cek Audio HAL.")
+                        }
                     }
+                    return
                 }
             }
+
+            // Aktifkan routing HAL FM sebagai fallback; beri tahu jika butuh izin priv-app
+            runCatching {
+                audioManager.setParameters("fm_mode=on")
+                audioManager.setParameters("fm_radio_mute=0")
+            }
+            releaseAudioHandles()
+            onError("Tuner /dev/radio0 aktif. AudioRecord(RADIO_TUNER) ditolak sistem karena aplikasi belum berstatus Priv-App. Pasang modul Priv-App KernelSU lalu reboot.")
         } catch (ex: Exception) {
             releaseAudioHandles()
             onError(ex.message ?: "Gagal memulai AudioTrack stream")
@@ -157,6 +221,8 @@ class FmAudioTrackEngine(private val context: Context) {
     private fun releaseAudioHandles() {
         streamJob?.cancel()
         streamJob = null
+        runCatching { tinycapProc?.destroy() }
+        tinycapProc = null
         try {
             audioRecord?.stop()
             audioRecord?.release()
@@ -171,7 +237,10 @@ class FmAudioTrackEngine(private val context: Context) {
     }
 
     fun stopAudioStream() {
-        runCatching { audioManager.setParameters("fm_mode=off") }
+        runCatching {
+            audioManager.setParameters("fm_radio_mute=1")
+            audioManager.setParameters("fm_mode=off")
+        }
         releaseAudioHandles()
     }
 }
