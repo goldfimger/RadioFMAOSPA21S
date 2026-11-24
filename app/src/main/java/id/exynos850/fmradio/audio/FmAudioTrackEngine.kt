@@ -105,12 +105,15 @@ class FmAudioTrackEngine(private val context: Context) {
             )
 
             if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                onError("AudioRecord RADIO_TUNER gagal diinisialisasi. Pastikan permission CAPTURE_AUDIO_OUTPUT & audio_policy A21s aktif.")
-                stopAudioStream()
+                // Tetap aktifkan routing HAL FM untuk perangkat yang memutar audio tuner langsung di codec
+                runCatching { audioManager.setParameters("fm_mode=on") }
+                releaseAudioHandles()
+                onError("Tuner /dev/radio0 aktif, tetapi AudioRecord(RADIO_TUNER) ditolak sistem (memerlukan izin CAPTURE_AUDIO_OUTPUT / priv-app LineageOS). Gunakan Android.bp di /system/priv-app atau routing HAL codec.")
                 return
             }
 
             applyRouting()
+            runCatching { audioManager.setParameters("fm_mode=on") }
             audioTrack?.setVolume(currentVolume)
             audioTrack?.play()
             audioRecord?.startRecording()
@@ -125,8 +128,8 @@ class FmAudioTrackEngine(private val context: Context) {
                 }
             }
         } catch (ex: Exception) {
+            releaseAudioHandles()
             onError(ex.message ?: "Gagal memulai AudioTrack stream")
-            stopAudioStream()
         }
     }
 
@@ -151,7 +154,7 @@ class FmAudioTrackEngine(private val context: Context) {
         audioTrack?.preferredDevice = device
     }
 
-    fun stopAudioStream() {
+    private fun releaseAudioHandles() {
         streamJob?.cancel()
         streamJob = null
         try {
@@ -165,5 +168,10 @@ class FmAudioTrackEngine(private val context: Context) {
         } catch (_: Exception) {}
         audioRecord = null
         audioTrack = null
+    }
+
+    fun stopAudioStream() {
+        runCatching { audioManager.setParameters("fm_mode=off") }
+        releaseAudioHandles()
     }
 }

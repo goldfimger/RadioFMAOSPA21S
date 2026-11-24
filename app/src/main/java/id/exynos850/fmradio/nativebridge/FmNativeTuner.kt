@@ -3,6 +3,9 @@ package id.exynos850.fmradio.nativebridge
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import java.io.BufferedReader
+import java.io.BufferedWriter
+import java.io.File
 
 data class HardwareSignalInfo(
     val rssiDbm: Int,
@@ -11,7 +14,7 @@ data class HardwareSignalInfo(
     val afcOffsetHz: Int
 )
 
-class FmNativeTuner {
+class FmNativeTuner(private val nativeLibDir: String = "") {
 
     companion object {
         const val MIN_FREQ_KHZ = 87500
@@ -23,28 +26,128 @@ class FmNativeTuner {
     }
 
     private var isOpen = false
+    private var usingRootDaemon = false
+    private var rootProc: Process? = null
+    private var rootWriter: BufferedWriter? = null
+    private var rootReader: BufferedReader? = null
+    private var rootLastError = ""
 
-    fun open(): Boolean {
-        isOpen = nativeOpenTuner()
-        return isOpen
+    @Synchronized
+    private fun rootCommand(cmd: String): String {
+        val w = rootWriter ?: return "ERR no_writer"
+        val r = rootReader ?: return "ERR no_reader"
+        return runCatching {
+            w.write(cmd)
+            w.newLine()
+            w.flush()
+            r.readLine() ?: "ERR eof"
+        }.getOrElse { "ERR ${it.message}" }
     }
 
+    private fun openViaRootDaemon(): Boolean {
+        if (nativeLibDir.isBlank()) {
+            rootLastError = "nativeLibDir kosong."
+            return false
+        }
+        val binFile = File(nativeLibDir, "liba21s_fm_rootd.so")
+        if (!binFile.exists()) {
+            rootLastError = "Helper root tidak ditemukan: ${binFile.absolutePath}"
+            return false
+        }
+        return runCatching {
+            val proc = ProcessBuilder("su", "-c", binFile.absolutePath)
+                .redirectErrorStream(true)
+                .start()
+            rootProc = proc
+            rootWriter = proc.outputStream.bufferedWriter()
+            rootReader = proc.inputStream.bufferedReader()
+
+            val resp = rootCommand("OPEN")
+            if (resp.startsWith("OK")) {
+                usingRootDaemon = true
+                isOpen = true
+                rootLastError = ""
+                true
+            } else {
+                rootLastError = "Root daemon gagal membuka /dev/radio0: $resp"
+                closeRootDaemon()
+                false
+            }
+        }.getOrElse { ex ->
+            rootLastError = "Gagal menjalankan su (KSU/Magisk): ${ex.message}"
+            closeRootDaemon()
+            false
+        }
+    }
+
+    private fun closeRootDaemon() {
+        runCatching { rootWriter?.write("CLOSE\n"); rootWriter?.flush() }
+        runCatching { rootWriter?.close() }
+        runCatching { rootReader?.close() }
+        runCatching { rootProc?.destroy() }
+        rootWriter = null
+        rootReader = null
+        rootProc = null
+        usingRootDaemon = false
+    }
+
+    fun open(allowRootFallback: Boolean = true): Boolean {
+        if (isOpen) return true
+        if (nativeOpenTuner()) {
+            usingRootDaemon = false
+            isOpen = true
+            return true
+        }
+        if (allowRootFallback && openViaRootDaemon()) {
+            return true
+        }
+        isOpen = false
+        return false
+    }
+
+    fun isUsingRootMode(): Boolean = usingRootDaemon
+
     fun close() {
-        if (isOpen) {
+        if (!isOpen) return
+        if (usingRootDaemon) {
+            rootCommand("MUTE 1")
+            closeRootDaemon()
+        } else {
             nativeSetMute(true)
             nativeCloseTuner()
-            isOpen = false
         }
+        isOpen = false
     }
 
     fun tuneManual(freqKhz: Int): Boolean {
         val clamped = freqKhz.coerceIn(MIN_FREQ_KHZ, MAX_FREQ_KHZ)
-        return nativeSetFrequency(clamped)
+        return if (usingRootDaemon) {
+            rootCommand("TUNE $clamped").startsWith("OK")
+        } else {
+            nativeSetFrequency(clamped)
+        }
     }
 
-    fun getCurrentFrequencyKhz(): Int = nativeGetFrequency()
+    fun getCurrentFrequencyKhz(): Int {
+        if (!usingRootDaemon) return nativeGetFrequency()
+        val parts = rootCommand("GETFREQ").split(" ")
+        return if (parts.getOrNull(0) == "OK") parts.getOrNull(1)?.toIntOrNull() ?: -1 else -1
+    }
 
     fun readSignalMetrics(): HardwareSignalInfo {
+        if (usingRootDaemon) {
+            val parts = rootCommand("SIGNAL").split(" ")
+            return if (parts.getOrNull(0) == "OK") {
+                HardwareSignalInfo(
+                    rssiDbm = parts.getOrNull(1)?.toIntOrNull() ?: -104,
+                    qualityPercent = (parts.getOrNull(2)?.toIntOrNull() ?: 0).coerceIn(0, 100),
+                    isStereo = parts.getOrNull(3) == "1",
+                    afcOffsetHz = parts.getOrNull(4)?.toIntOrNull() ?: 0
+                )
+            } else {
+                HardwareSignalInfo(-104, 0, false, 0)
+            }
+        }
         val raw = nativeGetSignalInfo()
         return HardwareSignalInfo(
             rssiDbm = raw.getOrElse(0) { -104 },
@@ -54,25 +157,30 @@ class FmNativeTuner {
         )
     }
 
-    fun setMute(mute: Boolean): Boolean = nativeSetMute(mute)
+    fun setMute(mute: Boolean): Boolean {
+        return if (usingRootDaemon) {
+            rootCommand("MUTE ${if (mute) 1 else 0}").startsWith("OK")
+        } else {
+            nativeSetMute(mute)
+        }
+    }
 
-    fun getLastError(): String = nativeGetLastError()
+    fun getLastError(): String = rootLastError.ifBlank { nativeGetLastError() }
 
     fun getDiagnosticReport(): String = nativeGetDiagnosticReport()
 
-    /**
-     * Jika perangkat sudah root (Magisk / KernelSU / LineageOS su), coba buka izin /dev/radio0
-     * dan tambahkan policy SELinux sementara agar untrusted_app bisa mengakses chr_file FM tuner.
-     */
     suspend fun tryUnlockViaRoot(): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        if (openViaRootDaemon()) {
+            return@withContext true to "Berhasil membuka /dev/radio0 via Root Daemon (KernelSU/Magisk)."
+        }
         runCatching {
             val cmd = """
-                ls -lZ /dev/radio* /dev/fm* /sys/class/video4linux/* 2>&1
-                chmod 0666 /dev/radio0 /dev/radio1 /dev/fmradio 2>/dev/null || true
-                if command -v magiskpolicy >/dev/null 2>&1; then
-                  magiskpolicy --live "allow untrusted_app fm_radio_device chr_file { read write open ioctl getattr }" "allow untrusted_app video_device chr_file { read write open ioctl getattr }" "allow untrusted_app device chr_file { read write open ioctl getattr }" 2>&1
-                elif command -v ksud >/dev/null 2>&1; then
-                  ksud sepolicy patch "allow untrusted_app fm_radio_device chr_file *" "allow untrusted_app video_device chr_file *" 2>&1
+                ls -lZ /dev/radio* 2>&1
+                chmod 0666 /dev/radio0 2>/dev/null || true
+                if command -v ksud >/dev/null 2>&1; then
+                  ksud sepolicy patch "allow untrusted_app device:chr_file { read write open ioctl getattr }" 2>&1 || true
+                elif command -v magiskpolicy >/dev/null 2>&1; then
+                  magiskpolicy --live "allow untrusted_app device chr_file { read write open ioctl getattr }" 2>&1 || true
                 fi
             """.trimIndent()
             val proc = ProcessBuilder("su", "-c", cmd)
@@ -80,41 +188,36 @@ class FmNativeTuner {
                 .start()
             val out = proc.inputStream.bufferedReader().readText()
             val code = proc.waitFor()
-            (code == 0) to out.ifBlank { "Perintah root selesai (exit=$code)" }
+            (code == 0) to (rootLastError + "\n" + out).trim()
         }.getOrElse { ex ->
-            false to "Root (su) tidak tersedia: ${ex.message}"
+            false to "Root (su) gagal: ${ex.message}"
         }
     }
 
-    /**
-     * Melakukan pencarian otomatis di spektrum FM.
-     * Jika ioctl VIDIOC_S_HW_FREQ_SEEK tidak didukung kernel, otomatis melakukan sweep software berbasis RSSI.
-     */
     suspend fun autoScanStations(
         spacingKhz: Int = 100,
         rssiThresholdDbm: Int = -78,
         onStepProgress: (currentFreqKhz: Int, signal: HardwareSignalInfo) -> Unit
     ): List<Pair<Int, HardwareSignalInfo>> = withContext(Dispatchers.IO) {
         val discovered = mutableListOf<Pair<Int, HardwareSignalInfo>>()
-        nativeSetMute(true)
+        setMute(true)
 
         var freq = MIN_FREQ_KHZ
         while (freq <= MAX_FREQ_KHZ) {
-            nativeSetFrequency(freq)
-            delay(45) // Settling time untuk PLL synthesizer FM Exynos 850
+            tuneManual(freq)
+            delay(45)
             val signal = readSignalMetrics()
             onStepProgress(freq, signal)
 
             if (signal.rssiDbm >= rssiThresholdDbm) {
                 discovered.add(freq to signal)
-                // Lompati bandwidth kanal (200 kHz) untuk menghindari duplikat carrier terdekat
                 freq += 200
             } else {
                 freq += spacingKhz
             }
         }
 
-        nativeSetMute(false)
+        setMute(false)
         discovered
     }
 

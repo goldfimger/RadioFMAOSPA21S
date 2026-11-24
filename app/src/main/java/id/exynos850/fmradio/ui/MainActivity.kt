@@ -13,8 +13,10 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -46,7 +48,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        fmTuner = FmNativeTuner()
+        fmTuner = FmNativeTuner(applicationInfo.nativeLibraryDir)
         audioEngine = FmAudioTrackEngine(this)
         dbHelper = FmStationDbHelper(this)
 
@@ -57,7 +59,7 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    OneUiRadioScreen(
+                    MonetRadioScreen(
                         isDarkMode = isDarkMode,
                         onToggleDarkMode = { isDarkMode = !isDarkMode }
                     )
@@ -67,7 +69,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun OneUiRadioScreen(
+    private fun MonetRadioScreen(
         isDarkMode: Boolean,
         onToggleDarkMode: () -> Unit
     ) {
@@ -81,6 +83,7 @@ class MainActivity : ComponentActivity() {
         var stations by remember { mutableStateOf(dbHelper.getAllStations()) }
         var tunerError by remember { mutableStateOf<String?>(null) }
         var diagnosticReport by remember { mutableStateOf<String?>(null) }
+        var isRootActive by remember { mutableStateOf(false) }
 
         val activeStation = stations.firstOrNull { it.frequencyKhz == freqKhz }
 
@@ -123,7 +126,8 @@ class MainActivity : ComponentActivity() {
                 ) {
                     permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                 }
-                if (fmTuner.open()) {
+                if (fmTuner.open(allowRootFallback = true)) {
+                    isRootActive = fmTuner.isUsingRootMode()
                     fmTuner.tuneManual(freqKhz)
                     audioEngine.startAudioStream(lifecycleScope) { err ->
                         tunerError = err
@@ -133,11 +137,13 @@ class MainActivity : ComponentActivity() {
                         delay(400)
                     }
                 } else {
+                    isRootActive = false
                     tunerError = fmTuner.getLastError().ifBlank { "/dev/radio0 tidak dapat dibuka" }
                     diagnosticReport = fmTuner.getDiagnosticReport()
                     isPlaying = false
                 }
             } else {
+                isRootActive = false
                 audioEngine.stopAudioStream()
                 fmTuner.close()
             }
@@ -150,7 +156,7 @@ class MainActivity : ComponentActivity() {
                 .padding(horizontal = 20.dp, vertical = 14.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // One UI Minimal Header
+            // Monet Minimal Header
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -190,16 +196,16 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Diagnostik Hardware (muncul hanya jika ada error)
+            // Diagnostik Hardware Scrollable (tombol selalu terlihat di bawah)
             if (tunerError != null) {
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(22.dp),
-                    color = MaterialTheme.colorScheme.surfaceVariant
+                    shape = RoundedCornerShape(24.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh
                 ) {
                     Column(
                         modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         Text(
                             text = "Diagnostik Hardware FM",
@@ -207,28 +213,52 @@ class MainActivity : ComponentActivity() {
                             fontWeight = FontWeight.SemiBold,
                             color = MaterialTheme.colorScheme.primary
                         )
-                        Text(text = tunerError!!, style = MaterialTheme.typography.bodySmall)
+                        Text(
+                            text = tunerError!!,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
                         if (!diagnosticReport.isNullOrBlank()) {
-                            Text(
-                                text = diagnosticReport!!,
-                                fontFamily = FontFamily.Monospace,
-                                fontSize = 11.sp,
-                                lineHeight = 15.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(
-                                onClick = {
-                                    lifecycleScope.launch {
-                                        val (ok, log) = fmTuner.tryUnlockViaRoot()
-                                        diagnosticReport = log + "\n" + fmTuner.getDiagnosticReport()
-                                        if (ok) isPlaying = true
-                                    }
-                                },
-                                shape = RoundedCornerShape(18.dp)
+                            Surface(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 170.dp),
+                                shape = RoundedCornerShape(14.dp),
+                                color = MaterialTheme.colorScheme.surfaceContainerLow
                             ) {
-                                Text("Buka via Root (su)", maxLines = 1, softWrap = false)
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .verticalScroll(rememberScrollState())
+                                        .padding(10.dp)
+                                ) {
+                                    Text(
+                                        text = diagnosticReport!!,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontSize = 11.sp,
+                                        lineHeight = 15.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            if (!isRootActive) {
+                                Button(
+                                    onClick = {
+                                        lifecycleScope.launch {
+                                            val (ok, log) = fmTuner.tryUnlockViaRoot()
+                                            diagnosticReport = log + "\n" + fmTuner.getDiagnosticReport()
+                                            if (ok) isPlaying = true
+                                        }
+                                    },
+                                    shape = RoundedCornerShape(18.dp)
+                                ) {
+                                    Text("Coba Root (KSU)", maxLines = 1, softWrap = false)
+                                }
                             }
                             TextButton(onClick = { tunerError = null }) {
                                 Text("Tutup")
@@ -238,11 +268,11 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Kartu Tuner Utama Gaya One UI
+            // Kartu Tuner Utama Material You (Monet)
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(28.dp),
-                color = MaterialTheme.colorScheme.surface
+                color = MaterialTheme.colorScheme.surfaceContainerLow
             ) {
                 Column(
                     modifier = Modifier
@@ -279,8 +309,9 @@ class MainActivity : ComponentActivity() {
                     // Status Sinyal & Antena Ringkas
                     val antennaLabel = if (hasHeadset) "Headset" else "Tanpa Antena"
                     val modeLabel = if (isPlaying) (if (signal.isStereo) "Stereo" else "Mono") else "Siaga"
+                    val accessLabel = if (isPlaying && isRootActive) " · Root" else ""
                     Text(
-                        text = "${signal.rssiDbm} dBm · ${signal.qualityPercent}% · $modeLabel · $antennaLabel",
+                        text = "${signal.rssiDbm} dBm · ${signal.qualityPercent}% · $modeLabel · $antennaLabel$accessLabel",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -332,7 +363,7 @@ class MainActivity : ComponentActivity() {
                         Slider(
                             value = freqKhz.toFloat(),
                             onValueChange = {
-                                freqKhz = ((it.toInt() + stepKhz / 2) / stepKhz) * stepKhz
+                                freqKhz = (((it.toInt() + stepKhz / 2) / stepKhz) * stepKhz).coerceIn(87500, 108000)
                                 if (isPlaying) fmTuner.tuneManual(freqKhz)
                             },
                             valueRange = 87500f..108000f,
@@ -465,13 +496,13 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Daftar Stasiun SQLite (Satu Kartu Terpadu ala One UI)
+            // Daftar Stasiun SQLite (Satu Kartu Monet)
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f),
                 shape = RoundedCornerShape(28.dp),
-                color = MaterialTheme.colorScheme.surface
+                color = MaterialTheme.colorScheme.surfaceContainerLow
             ) {
                 if (stations.isEmpty()) {
                     Box(
