@@ -6,30 +6,30 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 
-private val NightDarkColors = darkColorScheme(
-    primary = Color(0xFFF59E0B),
-    onPrimary = Color(0xFF0B0E14),
-    secondary = Color(0xFF10B981),
-    background = Color(0xFF0B0E14),
-    surface = Color(0xFF131822),
-    surfaceVariant = Color(0xFF1C2331),
-    onBackground = Color(0xFFE2E8F0),
-    onSurface = Color(0xFFE2E8F0),
-    onSurfaceVariant = Color(0xFF94A3B8),
-    outline = Color(0xFF283245)
+private val OneUiDarkColors = darkColorScheme(
+    primary = Color(0xFFFF7A38),
+    onPrimary = Color(0xFFFFFFFF),
+    secondary = Color(0xFF22C55E),
+    background = Color(0xFF000000),
+    surface = Color(0xFF17171A),
+    surfaceVariant = Color(0xFF222227),
+    onBackground = Color(0xFFF4F4F6),
+    onSurface = Color(0xFFF4F4F6),
+    onSurfaceVariant = Color(0xFF9A9AA6),
+    outline = Color(0xFF2A2A32)
 )
 
-private val DaylightColors = lightColorScheme(
-    primary = Color(0xFFD97706),
+private val OneUiLightColors = lightColorScheme(
+    primary = Color(0xFFE65100),
     onPrimary = Color(0xFFFFFFFF),
-    secondary = Color(0xFF059669),
-    background = Color(0xFFF8FAFC),
+    secondary = Color(0xFF16A34A),
+    background = Color(0xFFF6F6F8),
     surface = Color(0xFFFFFFFF),
-    surfaceVariant = Color(0xFFF1F5F9),
-    onBackground = Color(0xFF0F172A),
-    onSurface = Color(0xFF0F172A),
-    onSurfaceVariant = Color(0xFF475569),
-    outline = Color(0xFFE2E8F0)
+    surfaceVariant = Color(0xFFECEEF2),
+    onBackground = Color(0xFF121214),
+    onSurface = Color(0xFF121214),
+    onSurfaceVariant = Color(0xFF64646E),
+    outline = Color(0xFFE2E2E8)
 )
 
 @Composable
@@ -38,7 +38,7 @@ fun A21sFmTheme(
     content: @Composable () -> Unit
 ) {
     MaterialTheme(
-        colorScheme = if (darkTheme) NightDarkColors else DaylightColors,
+        colorScheme = if (darkTheme) OneUiDarkColors else OneUiLightColors,
         content = content
     )
 }

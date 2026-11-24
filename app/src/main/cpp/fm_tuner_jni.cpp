@@ -3,10 +3,13 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <stdio.h>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <sys/ioctl.h>
 #include <linux/videodev2.h>
 #include <android/log.h>
+#include <string>
 
 #define LOG_TAG "A21sFmNative"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -15,13 +18,17 @@
 namespace {
 constexpr const char* kRadioDevicePaths[] = {
     "/dev/radio0",
+    "/dev/radio1",
     "/dev/fmradio",
-    "/dev/s610_fm"
+    "/dev/s610_fm",
+    "/dev/fm"
 };
 
 int gRadioFd = -1;
 bool gCapLowFreq = true; // true = 62.5 Hz units (V4L2_TUNER_CAP_LOW)
 void* gVendorLibHandle = nullptr;
+std::string gLastError = "";
+std::string gOpenedNode = "";
 
 // Optional vendor symbol hooks for Samsung Exynos SLSI FM library
 using VendorSetFreqFn = int (*)(int freqKhz);
@@ -70,24 +77,118 @@ Java_id_exynos850_fmradio_nativebridge_FmNativeTuner_nativeOpenTuner(
     if (gRadioFd >= 0) return JNI_TRUE;
 
     tryLoadVendorFmLib();
+    gLastError.clear();
+    gOpenedNode.clear();
+
+    const int openFlags[] = { O_RDWR | O_NONBLOCK, O_RDWR, O_RDONLY | O_NONBLOCK, O_RDONLY };
+    int primaryErrno = ENOENT;
+    std::string attemptLog;
 
     for (const char* devPath : kRadioDevicePaths) {
-        int fd = open(devPath, O_RDWR | O_NONBLOCK);
-        if (fd >= 0) {
-            gRadioFd = fd;
-            struct v4l2_tuner tuner {};
-            tuner.index = 0;
-            tuner.type = V4L2_TUNER_RADIO;
-            if (ioctl(gRadioFd, VIDIOC_G_TUNER, &tuner) == 0) {
-                gCapLowFreq = (tuner.capability & V4L2_TUNER_CAP_LOW) != 0;
+        for (int flags : openFlags) {
+            errno = 0;
+            int fd = open(devPath, flags);
+            if (fd >= 0) {
+                gRadioFd = fd;
+                gOpenedNode = devPath;
+
+                struct v4l2_tuner tuner {};
+                tuner.index = 0;
+                tuner.type = V4L2_TUNER_RADIO;
+                if (ioctl(gRadioFd, VIDIOC_G_TUNER, &tuner) == 0) {
+                    gCapLowFreq = (tuner.capability & V4L2_TUNER_CAP_LOW) != 0;
+                    tuner.audmode = V4L2_TUNER_MODE_STEREO;
+                    ioctl(gRadioFd, VIDIOC_S_TUNER, &tuner);
+                }
+
+                // Unmute S610/V4L2 FM demodulator upon power on
+                struct v4l2_control muteCtrl {};
+                muteCtrl.id = V4L2_CID_AUDIO_MUTE;
+                muteCtrl.value = 0;
+                ioctl(gRadioFd, VIDIOC_S_CTRL, &muteCtrl);
+
+                LOGI("Opened FM tuner node %s (fd=%d, flags=%d, capLow=%d)", devPath, fd, flags, gCapLowFreq);
+                return JNI_TRUE;
             }
-            LOGI("Opened FM tuner node %s (fd=%d, capLow=%d)", devPath, fd, gCapLowFreq);
-            return JNI_TRUE;
+            int err = errno;
+            if (strcmp(devPath, "/dev/radio0") == 0 && flags == (O_RDWR | O_NONBLOCK)) {
+                primaryErrno = err;
+            }
         }
+        int checkErr = errno;
+        attemptLog += std::string(devPath) + ": " + strerror(checkErr) + " (" + std::to_string(checkErr) + "); ";
     }
 
-    LOGE("Failed to open FM device node: %s", strerror(errno));
+    if (primaryErrno == EACCES || primaryErrno == EPERM) {
+        gLastError = "EACCES (" + std::to_string(primaryErrno) + "): /dev/radio0 ada, tetapi akses ditolak oleh SELinux / izin aplikasi biasa. Gunakan Root (su) atau install sebagai priv-app LineageOS.";
+    } else if (primaryErrno == ENOENT) {
+        gLastError = "ENOENT (2): Node /dev/radio0 tidak ditemukan di kernel. Pastikan kernel LineageOS 22.2 A21s mengaktifkan CONFIG_RADIO_S610=y.";
+    } else {
+        gLastError = "Gagal membuka tuner (" + std::to_string(primaryErrno) + "): " + attemptLog;
+    }
+
+    LOGE("Failed to open FM device node: %s", gLastError.c_str());
     return JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_id_exynos850_fmradio_nativebridge_FmNativeTuner_nativeGetLastError(
+        JNIEnv* env, jobject /* thiz */) {
+    return env->NewStringUTF(gLastError.c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_id_exynos850_fmradio_nativebridge_FmNativeTuner_nativeGetDiagnosticReport(
+        JNIEnv* env, jobject /* thiz */) {
+    std::string report;
+
+    report += "Node /dev/radio* & /dev/fm*:\n";
+    DIR* devDir = opendir("/dev");
+    int foundNodes = 0;
+    if (devDir != nullptr) {
+        struct dirent* ent;
+        while ((ent = readdir(devDir)) != nullptr) {
+            if (strncmp(ent->d_name, "radio", 5) == 0 ||
+                strncmp(ent->d_name, "fm", 2) == 0 ||
+                strncmp(ent->d_name, "s610", 4) == 0) {
+                std::string full = std::string("/dev/") + ent->d_name;
+                int acc = access(full.c_str(), R_OK | W_OK);
+                report += " - " + full + (acc == 0 ? " [RW OK]" : std::string(" [") + strerror(errno) + "]") + "\n";
+                foundNodes++;
+            }
+        }
+        closedir(devDir);
+    } else {
+        report += " - Tidak bisa membaca /dev (" + std::string(strerror(errno)) + ")\n";
+    }
+    if (foundNodes == 0) {
+        report += " - Tidak ada node radio/fm terdeteksi di /dev\n";
+    }
+
+    report += "Sysfs V4L2 (/sys/class/video4linux):\n";
+    DIR* v4lDir = opendir("/sys/class/video4linux");
+    if (v4lDir != nullptr) {
+        struct dirent* ent;
+        int count = 0;
+        while ((ent = readdir(v4lDir)) != nullptr) {
+            if (ent->d_name[0] == '.') continue;
+            report += " - " + std::string(ent->d_name) + "\n";
+            count++;
+        }
+        if (count == 0) report += " - Kosong\n";
+        closedir(v4lDir);
+    } else {
+        report += " - " + std::string(strerror(errno)) + "\n";
+    }
+
+    report += "Vendor libfm:\n";
+    const char* libs[] = { "/vendor/lib64/libfm_slsi.so", "/vendor/lib64/libfm.so", "/system/lib64/libfm_slsi.so" };
+    for (const char* lib : libs) {
+        bool exists = (access(lib, F_OK) == 0);
+        report += " - " + std::string(lib) + (exists ? " [ADA]" : " [TIDAK ADA]") + "\n";
+    }
+
+    return env->NewStringUTF(report.c_str());
 }
 
 extern "C" JNIEXPORT void JNICALL

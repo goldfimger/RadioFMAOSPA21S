@@ -8,15 +8,21 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -47,8 +53,11 @@ class MainActivity : ComponentActivity() {
         setContent {
             var isDarkMode by remember { mutableStateOf(true) }
             A21sFmTheme(darkTheme = isDarkMode) {
-                Surface(modifier = Modifier.fillMaxSize()) {
-                    FmRadioScreen(
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    OneUiRadioScreen(
                         isDarkMode = isDarkMode,
                         onToggleDarkMode = { isDarkMode = !isDarkMode }
                     )
@@ -58,18 +67,22 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun FmRadioScreen(
+    private fun OneUiRadioScreen(
         isDarkMode: Boolean,
         onToggleDarkMode: () -> Unit
     ) {
         var freqKhz by remember { mutableIntStateOf(98700) }
-        var stepKhz by remember { mutableIntStateOf(100) }
+        val stepKhz = 100
         var isPlaying by remember { mutableStateOf(false) }
         var isScanning by remember { mutableStateOf(false) }
         var useSpeaker by remember { mutableStateOf(false) }
         var hasHeadset by remember { mutableStateOf(audioEngine.hasWiredHeadsetAntenna()) }
         var signal by remember { mutableStateOf(HardwareSignalInfo(-104, 0, false, 0)) }
         var stations by remember { mutableStateOf(dbHelper.getAllStations()) }
+        var tunerError by remember { mutableStateOf<String?>(null) }
+        var diagnosticReport by remember { mutableStateOf<String?>(null) }
+
+        val activeStation = stations.firstOrNull { it.frequencyKhz == freqKhz }
 
         val exportLauncher = rememberLauncherForActivityResult(
             ActivityResultContracts.CreateDocument("application/json")
@@ -89,7 +102,7 @@ class MainActivity : ComponentActivity() {
             ActivityResultContracts.RequestPermission()
         ) { granted ->
             if (!granted) {
-                Toast.makeText(this, "Izin RECORD_AUDIO diperlukan untuk AudioTrack FM", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Izin mikrofon diperlukan untuk AudioTrack FM", Toast.LENGTH_SHORT).show()
             }
         }
 
@@ -104,6 +117,7 @@ class MainActivity : ComponentActivity() {
 
         LaunchedEffect(isPlaying) {
             if (isPlaying) {
+                tunerError = null
                 if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO)
                     != PackageManager.PERMISSION_GRANTED
                 ) {
@@ -112,14 +126,15 @@ class MainActivity : ComponentActivity() {
                 if (fmTuner.open()) {
                     fmTuner.tuneManual(freqKhz)
                     audioEngine.startAudioStream(lifecycleScope) { err ->
-                        Toast.makeText(this@MainActivity, err, Toast.LENGTH_LONG).show()
+                        tunerError = err
                     }
                     while (isActive && isPlaying) {
                         signal = fmTuner.readSignalMetrics()
                         delay(400)
                     }
                 } else {
-                    Toast.makeText(this@MainActivity, "/dev/radio0 tidak dapat dibuka", Toast.LENGTH_LONG).show()
+                    tunerError = fmTuner.getLastError().ifBlank { "/dev/radio0 tidak dapat dibuka" }
+                    diagnosticReport = fmTuner.getDiagnosticReport()
                     isPlaying = false
                 }
             } else {
@@ -132,61 +147,255 @@ class MainActivity : ComponentActivity() {
             modifier = Modifier
                 .fillMaxSize()
                 .systemBarsPadding()
-                .padding(16.dp),
+                .padding(horizontal = 20.dp, vertical = 14.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
+            // One UI Minimal Header
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("A21s FM Radio", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    TextButton(onClick = onToggleDarkMode) {
-                        Text(if (isDarkMode) "Mode Terang" else "Mode Gelap")
+                Text(
+                    text = "Radio FM",
+                    fontSize = 26.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onBackground,
+                    maxLines = 1,
+                    softWrap = false
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    TextButton(
+                        onClick = onToggleDarkMode,
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                            text = if (isDarkMode) "Terang" else "Gelap",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            softWrap = false
+                        )
                     }
-                    OutlinedButton(onClick = { exportLauncher.launch("a21s_fm_stations.json") }) {
-                        Text("Ekspor JSON")
+                    TextButton(
+                        onClick = { exportLauncher.launch("a21s_fm_stations.json") },
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                            text = "Ekspor JSON",
+                            color = MaterialTheme.colorScheme.primary,
+                            maxLines = 1,
+                            softWrap = false
+                        )
                     }
                 }
             }
 
-            // Panel Frekuensi Utama & Indikator Sinyal
-            ElevatedCard(modifier = Modifier.fillMaxWidth()) {
-                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            // Diagnostik Hardware (muncul hanya jika ada error)
+            if (tunerError != null) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(22.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "Diagnostik Hardware FM",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(text = tunerError!!, style = MaterialTheme.typography.bodySmall)
+                        if (!diagnosticReport.isNullOrBlank()) {
+                            Text(
+                                text = diagnosticReport!!,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp,
+                                lineHeight = 15.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = {
+                                    lifecycleScope.launch {
+                                        val (ok, log) = fmTuner.tryUnlockViaRoot()
+                                        diagnosticReport = log + "\n" + fmTuner.getDiagnosticReport()
+                                        if (ok) isPlaying = true
+                                    }
+                                },
+                                shape = RoundedCornerShape(18.dp)
+                            ) {
+                                Text("Buka via Root (su)", maxLines = 1, softWrap = false)
+                            }
+                            TextButton(onClick = { tunerError = null }) {
+                                Text("Tutup")
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Kartu Tuner Utama Gaya One UI
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(28.dp),
+                color = MaterialTheme.colorScheme.surface
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp, vertical = 22.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
                     Text(
-                        text = String.format(Locale.US, "%.1f MHz", freqKhz / 1000.0),
-                        fontSize = 44.sp,
-                        fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Bold
+                        text = activeStation?.name ?: "Sinkronisasi Manual",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
+
+                    Row(verticalAlignment = Alignment.Bottom) {
+                        Text(
+                            text = String.format(Locale.US, "%.1f", freqKhz / 1000.0),
+                            fontSize = 56.sp,
+                            fontWeight = FontWeight.Light,
+                            fontFamily = FontFamily.SansSerif,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "MHz",
+                            fontSize = 18.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(bottom = 10.dp)
+                        )
+                    }
+
+                    // Status Sinyal & Antena Ringkas
+                    val antennaLabel = if (hasHeadset) "Headset" else "Tanpa Antena"
+                    val modeLabel = if (isPlaying) (if (signal.isStereo) "Stereo" else "Mono") else "Siaga"
                     Text(
-                        text = "RSSI: ${signal.rssiDbm} dBm · Kualitas: ${signal.qualityPercent}% · ${if (signal.isStereo) "Stereo" else "Mono"} · Antena: ${if (hasHeadset) "Headset Terpasang" else "Pasang Kabel 3.5mm"}",
-                        style = MaterialTheme.typography.bodySmall
+                        text = "${signal.rssiDbm} dBm · ${signal.qualityPercent}% · $modeLabel · $antennaLabel",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+
                     LinearProgressIndicator(
-                        progress = { signal.qualityPercent / 100f },
-                        modifier = Modifier.fillMaxWidth().height(8.dp)
+                        progress = { if (isPlaying) signal.qualityPercent / 100f else 0f },
+                        modifier = Modifier
+                            .fillMaxWidth(0.65f)
+                            .height(3.dp),
+                        trackColor = MaterialTheme.colorScheme.surfaceVariant
                     )
-                    Slider(
-                        value = freqKhz.toFloat(),
-                        onValueChange = {
-                            freqKhz = ((it.toInt() + stepKhz / 2) / stepKhz) * stepKhz
-                            if (isPlaying) fmTuner.tuneManual(freqKhz)
-                        },
-                        valueRange = 87500f..108000f
-                    )
+
+                    // Skala Dial Garis Gaya One UI
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 6.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        val tickColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
+                        val needleColor = MaterialTheme.colorScheme.primary
+                        Canvas(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(26.dp)
+                        ) {
+                            val totalTicks = 41
+                            val stepX = size.width / (totalTicks - 1)
+                            for (i in 0 until totalTicks) {
+                                val x = i * stepX
+                                val isMajor = i % 5 == 0
+                                val h = if (isMajor) size.height * 0.72f else size.height * 0.38f
+                                drawLine(
+                                    color = tickColor,
+                                    start = Offset(x, (size.height - h) / 2f),
+                                    end = Offset(x, (size.height + h) / 2f),
+                                    strokeWidth = if (isMajor) 2.5f else 1.5f
+                                )
+                            }
+                            val ratio = (freqKhz - 87500f) / (108000f - 87500f)
+                            val needleX = ratio * size.width
+                            drawLine(
+                                color = needleColor,
+                                start = Offset(needleX, 0f),
+                                end = Offset(needleX, size.height),
+                                strokeWidth = 5f
+                            )
+                        }
+                        Slider(
+                            value = freqKhz.toFloat(),
+                            onValueChange = {
+                                freqKhz = ((it.toInt() + stepKhz / 2) / stepKhz) * stepKhz
+                                if (isPlaying) fmTuner.tuneManual(freqKhz)
+                            },
+                            valueRange = 87500f..108000f,
+                            colors = SliderDefaults.colors(
+                                thumbColor = MaterialTheme.colorScheme.primary,
+                                activeTrackColor = androidx.compose.ui.graphics.Color.Transparent,
+                                inactiveTrackColor = androidx.compose.ui.graphics.Color.Transparent
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+
+                    // Tombol Transport Utama (< Power >)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        FilledTonalIconButton(
+                            onClick = {
+                                freqKhz = (freqKhz - stepKhz).coerceAtLeast(87500)
+                                if (isPlaying) fmTuner.tuneManual(freqKhz)
+                            },
+                            modifier = Modifier.size(48.dp),
+                            shape = CircleShape
+                        ) {
+                            Text("‹", fontSize = 24.sp, fontWeight = FontWeight.Medium)
+                        }
+
+                        Button(
+                            onClick = { isPlaying = !isPlaying },
+                            modifier = Modifier.size(64.dp),
+                            shape = CircleShape,
+                            contentPadding = PaddingValues(0.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (isPlaying) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
+                                contentColor = if (isPlaying) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
+                            )
+                        ) {
+                            Text(
+                                text = if (isPlaying) "■" else "▶",
+                                fontSize = 20.sp
+                            )
+                        }
+
+                        FilledTonalIconButton(
+                            onClick = {
+                                freqKhz = (freqKhz + stepKhz).coerceAtMost(108000)
+                                if (isPlaying) fmTuner.tuneManual(freqKhz)
+                            },
+                            modifier = Modifier.size(48.dp),
+                            shape = CircleShape
+                        ) {
+                            Text("›", fontSize = 24.sp, fontWeight = FontWeight.Medium)
+                        }
+                    }
+
+                    // 3 Tombol Aksi Ringkas
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Button(
-                            onClick = { isPlaying = !isPlaying },
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text(if (isPlaying) "Matikan Tuner" else "Nyalakan Tuner")
-                        }
-                        OutlinedButton(
+                        FilledTonalButton(
                             onClick = {
                                 if (!isScanning) {
                                     isScanning = true
@@ -200,7 +409,7 @@ class MainActivity : ComponentActivity() {
                                                 FmStationEntity(
                                                     frequencyKhz = f,
                                                     name = String.format(Locale.US, "FM %.1f", f / 1000.0),
-                                                    genre = "Hasil Scan",
+                                                    genre = "Auto-Scan",
                                                     rssiDbm = sig.rssiDbm,
                                                     isFavorite = false,
                                                     isStereo = sig.isStereo
@@ -212,75 +421,148 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                             },
-                            enabled = isPlaying && !isScanning
+                            enabled = isPlaying && !isScanning,
+                            shape = RoundedCornerShape(18.dp),
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp)
                         ) {
-                            Text(if (isScanning) "Memindai..." else "Auto-Scan")
+                            Text(if (isScanning) "Scan..." else "Auto-Scan", maxLines = 1, softWrap = false, fontSize = 12.sp)
                         }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(onClick = {
-                            useSpeaker = !useSpeaker
-                            audioEngine.setSpeakerOutput(useSpeaker)
-                        }) {
-                            Text(if (useSpeaker) "Output: Speaker" else "Output: Headset")
+
+                        FilledTonalButton(
+                            onClick = {
+                                useSpeaker = !useSpeaker
+                                audioEngine.setSpeakerOutput(useSpeaker)
+                            },
+                            shape = RoundedCornerShape(18.dp),
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp)
+                        ) {
+                            Text(if (useSpeaker) "Speaker" else "Headset", maxLines = 1, softWrap = false, fontSize = 12.sp)
                         }
-                        FilledTonalButton(onClick = {
-                            dbHelper.upsertStation(
-                                FmStationEntity(
-                                    frequencyKhz = freqKhz,
-                                    name = String.format(Locale.US, "Favorit %.1f", freqKhz / 1000.0),
-                                    genre = "Favorit",
-                                    rssiDbm = signal.rssiDbm,
-                                    isFavorite = true,
-                                    isStereo = signal.isStereo
+
+                        FilledTonalButton(
+                            onClick = {
+                                dbHelper.upsertStation(
+                                    FmStationEntity(
+                                        frequencyKhz = freqKhz,
+                                        name = activeStation?.name ?: String.format(Locale.US, "FM %.1f", freqKhz / 1000.0),
+                                        genre = "Favorit",
+                                        rssiDbm = signal.rssiDbm,
+                                        isFavorite = true,
+                                        isStereo = signal.isStereo
+                                    )
                                 )
-                            )
-                            stations = dbHelper.getAllStations()
-                        }) {
-                            Text("Simpan Favorit")
+                                stations = dbHelper.getAllStations()
+                            },
+                            shape = RoundedCornerShape(18.dp),
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp)
+                        ) {
+                            Text("★ Simpan", maxLines = 1, softWrap = false, fontSize = 12.sp)
                         }
                     }
                 }
             }
 
-            // Daftar Stasiun SQLite
-            LazyColumn(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+            // Daftar Stasiun SQLite (Satu Kartu Terpadu ala One UI)
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                shape = RoundedCornerShape(28.dp),
+                color = MaterialTheme.colorScheme.surface
             ) {
-                items(stations, key = { it.id }) { st ->
-                    OutlinedCard(
-                        onClick = {
-                            freqKhz = st.frequencyKhz
-                            if (isPlaying) fmTuner.tuneManual(freqKhz)
-                        },
-                        modifier = Modifier.fillMaxWidth()
+                if (stations.isEmpty()) {
+                    Box(
+                        modifier = Modifier.fillMaxSize(),
+                        contentAlignment = Alignment.Center
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(12.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column {
-                                Text(st.name, fontWeight = FontWeight.SemiBold)
-                                Text(
-                                    String.format(Locale.US, "%.1f MHz · %s · %d dBm", st.frequencyKhz / 1000.0, st.genre, st.rssiDbm),
-                                    style = MaterialTheme.typography.bodySmall
-                                )
+                        Text(
+                            text = "Belum ada stasiun tersimpan",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(vertical = 8.dp)
+                    ) {
+                        itemsIndexed(stations, key = { _, st -> st.id }) { index, st ->
+                            val isSelected = st.frequencyKhz == freqKhz
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        freqKhz = st.frequencyKhz
+                                        if (isPlaying) fmTuner.tuneManual(freqKhz)
+                                    }
+                                    .padding(horizontal = 20.dp, vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(14.dp),
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text(
+                                        text = String.format(Locale.US, "%.1f", st.frequencyKhz / 1000.0),
+                                        fontFamily = FontFamily.Monospace,
+                                        fontWeight = FontWeight.SemiBold,
+                                        fontSize = 16.sp,
+                                        color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Column {
+                                        Text(
+                                            text = st.name,
+                                            fontWeight = FontWeight.Medium,
+                                            fontSize = 15.sp,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                                        )
+                                        Text(
+                                            text = "${st.rssiDbm} dBm · ${st.genre}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    IconButton(
+                                        onClick = {
+                                            dbHelper.toggleFavorite(st.id, !st.isFavorite)
+                                            stations = dbHelper.getAllStations()
+                                        }
+                                    ) {
+                                        Text(
+                                            text = if (st.isFavorite) "★" else "☆",
+                                            fontSize = 18.sp,
+                                            color = if (st.isFavorite) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                    IconButton(
+                                        onClick = {
+                                            dbHelper.deleteStation(st.id)
+                                            stations = dbHelper.getAllStations()
+                                        }
+                                    ) {
+                                        Text(
+                                            text = "×",
+                                            fontSize = 20.sp,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
                             }
-                            Row {
-                                TextButton(onClick = {
-                                    dbHelper.toggleFavorite(st.id, !st.isFavorite)
-                                    stations = dbHelper.getAllStations()
-                                }) {
-                                    Text(if (st.isFavorite) "★ Favorit" else "☆")
-                                }
-                                TextButton(onClick = {
-                                    dbHelper.deleteStation(st.id)
-                                    stations = dbHelper.getAllStations()
-                                }) {
-                                    Text("Hapus")
-                                }
+                            if (index < stations.lastIndex) {
+                                HorizontalDivider(
+                                    modifier = Modifier.padding(horizontal = 20.dp),
+                                    thickness = 0.5.dp,
+                                    color = MaterialTheme.colorScheme.outline
+                                )
                             }
                         }
                     }

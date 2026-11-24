@@ -56,6 +56,36 @@ class FmNativeTuner {
 
     fun setMute(mute: Boolean): Boolean = nativeSetMute(mute)
 
+    fun getLastError(): String = nativeGetLastError()
+
+    fun getDiagnosticReport(): String = nativeGetDiagnosticReport()
+
+    /**
+     * Jika perangkat sudah root (Magisk / KernelSU / LineageOS su), coba buka izin /dev/radio0
+     * dan tambahkan policy SELinux sementara agar untrusted_app bisa mengakses chr_file FM tuner.
+     */
+    suspend fun tryUnlockViaRoot(): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        runCatching {
+            val cmd = """
+                ls -lZ /dev/radio* /dev/fm* /sys/class/video4linux/* 2>&1
+                chmod 0666 /dev/radio0 /dev/radio1 /dev/fmradio 2>/dev/null || true
+                if command -v magiskpolicy >/dev/null 2>&1; then
+                  magiskpolicy --live "allow untrusted_app fm_radio_device chr_file { read write open ioctl getattr }" "allow untrusted_app video_device chr_file { read write open ioctl getattr }" "allow untrusted_app device chr_file { read write open ioctl getattr }" 2>&1
+                elif command -v ksud >/dev/null 2>&1; then
+                  ksud sepolicy patch "allow untrusted_app fm_radio_device chr_file *" "allow untrusted_app video_device chr_file *" 2>&1
+                fi
+            """.trimIndent()
+            val proc = ProcessBuilder("su", "-c", cmd)
+                .redirectErrorStream(true)
+                .start()
+            val out = proc.inputStream.bufferedReader().readText()
+            val code = proc.waitFor()
+            (code == 0) to out.ifBlank { "Perintah root selesai (exit=$code)" }
+        }.getOrElse { ex ->
+            false to "Root (su) tidak tersedia: ${ex.message}"
+        }
+    }
+
     /**
      * Melakukan pencarian otomatis di spektrum FM.
      * Jika ioctl VIDIOC_S_HW_FREQ_SEEK tidak didukung kernel, otomatis melakukan sweep software berbasis RSSI.
@@ -95,4 +125,6 @@ class FmNativeTuner {
     private external fun nativeGetSignalInfo(): IntArray
     private external fun nativeSeekFrequency(seekUp: Boolean, spacingKhz: Int): Int
     private external fun nativeSetMute(mute: Boolean): Boolean
+    private external fun nativeGetLastError(): String
+    private external fun nativeGetDiagnosticReport(): String
 }
