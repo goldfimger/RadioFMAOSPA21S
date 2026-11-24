@@ -93,6 +93,15 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        DisposableEffect(Unit) {
+            val callback = audioEngine.registerAntennaCallback { connected ->
+                hasHeadset = connected
+            }
+            onDispose {
+                audioEngine.unregisterAntennaCallback(callback)
+            }
+        }
+
         LaunchedEffect(isPlaying) {
             if (isPlaying) {
                 if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO)
@@ -122,6 +131,7 @@ class MainActivity : ComponentActivity() {
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .systemBarsPadding()
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {

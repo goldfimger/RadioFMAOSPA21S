@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.22.1)
+cmake_minimum_required(VERSION 3.22.1...3.31.6)
 project("a21s_fm_jni")
 
 add_library(a21s_fm_jni SHARED
