@@ -63,9 +63,13 @@ class FmAudioTrackEngine(private val context: Context) {
     fun startAudioStream(
         scope: CoroutineScope,
         rootFmPcm: Pair<Int, Int>? = null,
+        rootDaemonPath: String = "",
         onError: (String) -> Unit
     ) {
         if (streamJob?.isActive == true) return
+
+        val hasCapturePerm = context.checkSelfPermission(android.Manifest.permission.CAPTURE_AUDIO_OUTPUT) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
 
         val minRecordBuf = AudioRecord.getMinBufferSize(
             SAMPLE_RATE,
@@ -133,13 +137,13 @@ class FmAudioTrackEngine(private val context: Context) {
                 return
             }
 
-            // Fallback Root ALSA PCM (tinycap -> AudioTrack) jika perangkat mengekspos node PCM FM di /proc/asound/pcm
-            if (rootFmPcm != null) {
+            // Fallback Root ALSA PCM (liba21s_fm_rootd.so pcm -> AudioTrack) tanpa butuh tinycap
+            if (rootFmPcm != null && rootDaemonPath.isNotBlank()) {
                 val (card, dev) = rootFmPcm
                 val proc = runCatching {
                     ProcessBuilder(
                         "su", "-c",
-                        "if command -v tinycap >/dev/null 2>&1; then exec tinycap - -D $card -d $dev -r $SAMPLE_RATE -c 2 -b 16; fi"
+                        "$rootDaemonPath pcm $card $dev $SAMPLE_RATE 2"
                     ).start()
                 }.getOrNull()
 
@@ -153,44 +157,34 @@ class FmAudioTrackEngine(private val context: Context) {
                     streamJob = scope.launch(Dispatchers.IO) {
                         val byteBuf = ByteArray(4096)
                         val input = proc.inputStream
-                        var firstChunk = true
                         var totalWritten = 0L
                         while (isActive) {
                             val readBytes = input.read(byteBuf)
                             if (readBytes <= 0) break
-                            var offset = 0
-                            var len = readBytes
-                            if (firstChunk && readBytes > 44 &&
-                                byteBuf[0] == 'R'.code.toByte() &&
-                                byteBuf[1] == 'I'.code.toByte() &&
-                                byteBuf[2] == 'F'.code.toByte() &&
-                                byteBuf[3] == 'F'.code.toByte()
-                            ) {
-                                offset = 44
-                                len = readBytes - 44
-                            }
-                            firstChunk = false
-                            if (len > 0) {
-                                audioTrack?.write(byteBuf, offset, len, AudioTrack.WRITE_BLOCKING)
-                                totalWritten += len
-                            }
+                            audioTrack?.write(byteBuf, 0, readBytes, AudioTrack.WRITE_BLOCKING)
+                            totalWritten += readBytes
                         }
                         if (isActive && totalWritten == 0L) {
                             releaseAudioHandles()
-                            onError("Tuner /dev/radio0 aktif, tetapi stream ALSA FM belum tersedia. Pasang modul Priv-App KernelSU lalu reboot, atau cek Audio HAL.")
+                            onError("Node PCM ALSA tidak mengirim data. Tekan 'Cek Audio HAL' lalu 'Salin Log'.")
                         }
                     }
                     return
                 }
             }
 
-            // Aktifkan routing HAL FM sebagai fallback; beri tahu jika butuh izin priv-app
+            // Aktifkan routing HAL FM sebagai fallback dan beri diagnosa izin yang spesifik
             runCatching {
                 audioManager.setParameters("fm_mode=on")
                 audioManager.setParameters("fm_radio_mute=0")
             }
             releaseAudioHandles()
-            onError("Tuner /dev/radio0 aktif. AudioRecord(RADIO_TUNER) ditolak sistem karena aplikasi belum berstatus Priv-App. Pasang modul Priv-App KernelSU lalu reboot.")
+            val permNote = if (hasCapturePerm) {
+                "Izin CAPTURE_AUDIO_OUTPUT sudah AKTIF, tetapi audio_policy LineageOS belum mendaftarkan AUDIO_DEVICE_IN_FM_TUNER."
+            } else {
+                "Izin CAPTURE_AUDIO_OUTPUT masih DENIED (APK user di /data/app menimpa priv-app atau modul KSU belum termount)."
+            }
+            onError("Tuner /dev/radio0 aktif! $permNote Tekan 'Cek Audio HAL' lalu 'Salin Log'.")
         } catch (ex: Exception) {
             releaseAudioHandles()
             onError(ex.message ?: "Gagal memulai AudioTrack stream")

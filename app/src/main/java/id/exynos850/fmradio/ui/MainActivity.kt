@@ -1,6 +1,9 @@
 package id.exynos850.fmradio.ui
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.widget.Toast
@@ -87,6 +90,29 @@ class MainActivity : ComponentActivity() {
 
         val activeStation = stations.firstOrNull { it.frequencyKhz == freqKhz }
 
+        val triggerBugReport: () -> Unit = {
+            lifecycleScope.launch {
+                val hasCapture = ContextCompat.checkSelfPermission(
+                    this@MainActivity,
+                    Manifest.permission.CAPTURE_AUDIO_OUTPUT
+                ) == PackageManager.PERMISSION_GRANTED
+                val (ok, msg) = fmTuner.generateAndSaveBugReport(
+                    packageName = packageName,
+                    hasCapturePermission = hasCapture,
+                    nativeDiag = fmTuner.getDiagnosticReport(),
+                    extraStatus = tunerError
+                )
+                if (tunerError != null) {
+                    diagnosticReport = msg
+                }
+                Toast.makeText(
+                    this@MainActivity,
+                    if (ok) "Disimpan ke /sdcard/A21s_FM_BugReport.txt" else msg,
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+
         val exportLauncher = rememberLauncherForActivityResult(
             ActivityResultContracts.CreateDocument("application/json")
         ) { uri ->
@@ -131,7 +157,11 @@ class MainActivity : ComponentActivity() {
                     isRootActive = fmTuner.isUsingRootMode()
                     fmTuner.tuneManual(freqKhz)
                     val rootFmPcm = fmTuner.detectRootFmPcm()
-                    audioEngine.startAudioStream(lifecycleScope, rootFmPcm) { err ->
+                    audioEngine.startAudioStream(
+                        scope = lifecycleScope,
+                        rootFmPcm = rootFmPcm,
+                        rootDaemonPath = fmTuner.getRootDaemonBinaryPath()
+                    ) { err ->
                         tunerError = err
                     }
                     while (isActive && isPlaying) {
@@ -156,7 +186,7 @@ class MainActivity : ComponentActivity() {
                 .fillMaxSize()
                 .systemBarsPadding()
                 .padding(horizontal = 20.dp, vertical = 14.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             // Monet Minimal Header
             Row(
@@ -198,7 +228,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Diagnostik Hardware Scrollable (tombol selalu terlihat di bawah)
+            // Diagnostik Hardware Scrollable (tombol rapi dengan FlowRow, tidak terpotong)
             if (tunerError != null) {
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
@@ -206,8 +236,8 @@ class MainActivity : ComponentActivity() {
                     color = MaterialTheme.colorScheme.surfaceContainerHigh
                 ) {
                     Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Text(
                             text = if (isRootActive) "Status Audio FM (Tuner Aktif)" else "Diagnostik Hardware FM",
@@ -224,7 +254,7 @@ class MainActivity : ComponentActivity() {
                             Surface(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .heightIn(max = 170.dp),
+                                    .heightIn(max = 135.dp),
                                 shape = RoundedCornerShape(14.dp),
                                 color = MaterialTheme.colorScheme.surfaceContainerLow
                             ) {
@@ -244,9 +274,11 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         }
-                        Row(
+                        @OptIn(ExperimentalLayoutApi::class)
+                        FlowRow(
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                             if (!isRootActive) {
                                 Button(
@@ -263,9 +295,13 @@ class MainActivity : ComponentActivity() {
                                     },
                                     shape = RoundedCornerShape(18.dp)
                                 ) {
-                                    Text("Coba Root (KSU)", maxLines = 1, softWrap = false)
+                                    Text("Coba Root (KSU)", maxLines = 1, softWrap = false, fontSize = 12.sp)
                                 }
                             } else {
+                                val hasCapture = ContextCompat.checkSelfPermission(
+                                    this@MainActivity,
+                                    Manifest.permission.CAPTURE_AUDIO_OUTPUT
+                                ) == PackageManager.PERMISSION_GRANTED
                                 Button(
                                     onClick = {
                                         lifecycleScope.launch {
@@ -274,14 +310,14 @@ class MainActivity : ComponentActivity() {
                                         }
                                     },
                                     shape = RoundedCornerShape(18.dp),
-                                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
                                 ) {
                                     Text("Pasang Priv-App (KSU)", maxLines = 1, softWrap = false, fontSize = 12.sp)
                                 }
                                 FilledTonalButton(
                                     onClick = {
                                         lifecycleScope.launch {
-                                            diagnosticReport = fmTuner.getRootAudioDiagnostic()
+                                            diagnosticReport = fmTuner.getRootAudioDiagnostic(packageName, hasCapture)
                                         }
                                     },
                                     shape = RoundedCornerShape(18.dp),
@@ -289,9 +325,32 @@ class MainActivity : ComponentActivity() {
                                 ) {
                                     Text("Cek Audio HAL", maxLines = 1, softWrap = false, fontSize = 12.sp)
                                 }
+                                if (!diagnosticReport.isNullOrBlank()) {
+                                    FilledTonalButton(
+                                        onClick = {
+                                            val cb = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                            cb.setPrimaryClip(ClipData.newPlainText("A21s FM Log", diagnosticReport))
+                                            Toast.makeText(this@MainActivity, "Log disalin", Toast.LENGTH_SHORT).show()
+                                        },
+                                        shape = RoundedCornerShape(18.dp),
+                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                                    ) {
+                                        Text("Salin Log", maxLines = 1, softWrap = false, fontSize = 12.sp)
+                                    }
+                                }
                             }
-                            TextButton(onClick = { tunerError = null }) {
-                                Text("Tutup")
+                            FilledTonalButton(
+                                onClick = triggerBugReport,
+                                shape = RoundedCornerShape(18.dp),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                            ) {
+                                Text("Bug Report (.txt)", maxLines = 1, softWrap = false, fontSize = 12.sp)
+                            }
+                            TextButton(
+                                onClick = { tunerError = null },
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                            ) {
+                                Text("Tutup", maxLines = 1, softWrap = false, fontSize = 12.sp)
                             }
                         }
                     }
@@ -534,22 +593,53 @@ class MainActivity : ComponentActivity() {
                 shape = RoundedCornerShape(28.dp),
                 color = MaterialTheme.colorScheme.surfaceContainerLow
             ) {
-                if (stations.isEmpty()) {
-                    Box(
-                        modifier = Modifier.fillMaxSize(),
-                        contentAlignment = Alignment.Center
+                Column(modifier = Modifier.fillMaxSize()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 20.dp, end = 12.dp, top = 8.dp, bottom = 2.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "Belum ada stasiun tersimpan",
-                            style = MaterialTheme.typography.bodyMedium,
+                            text = "Stasiun (${stations.size})",
+                            style = MaterialTheme.typography.labelLarge,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                        TextButton(
+                            onClick = triggerBugReport,
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = "Bug Report (.txt)",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.primary,
+                                maxLines = 1,
+                                softWrap = false
+                            )
+                        }
                     }
-                } else {
-                    LazyColumn(
-                        modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(vertical = 8.dp)
-                    ) {
+
+                    if (stations.isEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "Belum ada stasiun tersimpan",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    } else {
+                        LazyColumn(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f),
+                            contentPadding = PaddingValues(vertical = 4.dp)
+                        ) {
                         itemsIndexed(stations, key = { _, st -> st.id }) { index, st ->
                             val isSelected = st.frequencyKhz == freqKhz
                             Row(
@@ -628,6 +718,7 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
+            }
             }
         }
     }
