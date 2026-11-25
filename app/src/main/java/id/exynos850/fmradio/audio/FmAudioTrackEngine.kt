@@ -26,6 +26,8 @@ class FmAudioTrackEngine(private val context: Context) {
     private var streamJob: Job? = null
     private var currentVolume = 0.85f
     private var isSpeakerForced = false
+    @Volatile var lastStreamStats: String = "idle"
+        private set
 
     fun hasWiredHeadsetAntenna(): Boolean {
         val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
@@ -59,6 +61,7 @@ class FmAudioTrackEngine(private val context: Context) {
         rootFmPcm: Pair<Int, Int>? = null,
         rootDaemonPath: String = "",
         alsaRouteStatus: String = "",
+        onLog: (String) -> Unit = {},
         onError: (String) -> Unit
     ) {
         if (streamJob?.isActive == true) return
@@ -104,6 +107,8 @@ class FmAudioTrackEngine(private val context: Context) {
                     pcmStreamProc = proc
                     applyRouting()
                     audioTrack?.setVolume(currentVolume)
+                    lastStreamStats = "starting pcmC${card}D${dev}c"
+                    onLog("AudioEngine start pcmC${card}D${dev}c route=$alsaRouteStatus")
 
                     streamJob = scope.launch(Dispatchers.IO) {
                         val errBuf = StringBuilder()
@@ -119,6 +124,8 @@ class FmAudioTrackEngine(private val context: Context) {
                         val byteBuf = ByteArray(3840)
                         val input = proc.inputStream
                         var totalWritten = 0L
+                        var peakAbs = 0
+                        var writeErr = 0
                         var playbackStarted = false
                         while (isActive) {
                             val readBytes = input.read(byteBuf)
@@ -126,16 +133,34 @@ class FmAudioTrackEngine(private val context: Context) {
                             if (!playbackStarted) {
                                 audioTrack?.play()
                                 playbackStarted = true
+                                onLog("AudioTrack play() started firstBytes=$readBytes")
                             }
-                            audioTrack?.write(byteBuf, 0, readBytes, AudioTrack.WRITE_BLOCKING)
-                            totalWritten += readBytes
+                            var i = 0
+                            while (i + 1 < readBytes) {
+                                val lo = byteBuf[i].toInt() and 0xFF
+                                val hi = byteBuf[i + 1].toInt()
+                                val sample = (hi shl 8) or lo
+                                val a = if (sample < 0) -sample else sample
+                                if (a > peakAbs) peakAbs = a
+                                i += 2
+                            }
+                            val w = audioTrack?.write(byteBuf, 0, readBytes, AudioTrack.WRITE_BLOCKING) ?: -1
+                            if (w < 0) {
+                                writeErr = w
+                                break
+                            }
+                            totalWritten += w
+                            lastStreamStats = "streaming bytes=$totalWritten peak=$peakAbs"
                         }
                         errReaderJob.join()
-                        if (isActive && totalWritten == 0L) {
-                            val stderrText = errBuf.toString().trim().ifBlank { "EOF tanpa data" }
+                        val exitCode = runCatching { proc.waitFor() }.getOrDefault(-1)
+                        val stderrText = errBuf.toString().trim().ifBlank { "EOF" }
+                        lastStreamStats = "ended bytes=$totalWritten peak=$peakAbs writeErr=$writeErr exit=$exitCode ($stderrText)"
+                        onLog("AudioEngine $lastStreamStats")
+                        if (isActive) {
                             releaseAudioHandles()
                             withContext(Dispatchers.Main) {
-                                onError("Stream ALSA pcmC${card}D${dev}c kosong ($stderrText) | Route: $alsaRouteStatus")
+                                onError("Stream ALSA berhenti (bytes=$totalWritten, peak=$peakAbs, writeErr=$writeErr, $stderrText) | Route: $alsaRouteStatus")
                             }
                         }
                     }
@@ -162,13 +187,16 @@ class FmAudioTrackEngine(private val context: Context) {
     }
 
     private fun applyRouting() {
-        val targetType = if (isSpeakerForced) {
-            AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+        val outputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        val device = if (isSpeakerForced) {
+            outputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
         } else {
-            AudioDeviceInfo.TYPE_WIRED_HEADSET
+            outputs.firstOrNull {
+                it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                    it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                    it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+            }
         }
-        val device = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-            .firstOrNull { it.type == targetType }
         audioTrack?.preferredDevice = device
     }
 

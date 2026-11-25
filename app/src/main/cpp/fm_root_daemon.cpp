@@ -197,7 +197,7 @@ bool setAlsaControl(const std::string& ctlName, const std::string& ctlVal) {
     return ok;
 }
 
-std::string enableFmAlsaRoute(bool useAsrc = true) {
+std::string enableFmAlsaRoute(bool useAsrc = false, unsigned int wdmaRate = 48000) {
     // Sesuai /vendor/etc/mixer_paths.xml Exynos 850:
     // <path name="route-fm"> -> NSRC2=SPDY, SIFM2=WDMA, WDMA2->VPCMIN_DAI4 & VPCMIN_DAI7
     bool sw = setAlsaControl("ABOX SPDY CAP SPDY Switch", "1");
@@ -212,11 +212,13 @@ std::string enableFmAlsaRoute(bool useAsrc = true) {
         setAlsaControl("ABOX SPUM ASRC2 IS", "BCLK_SPDY");
         setAlsaControl("ABOX SPUM ASRC2 OS", "ABOX");
         setAlsaControl("ABOX SPUM ASRC2", "1");
-        setAlsaControl("ABOX WDMA2 Rate", "48000");
+        setAlsaControl("ABOX WDMA2 Rate", std::to_string(wdmaRate));
     } else {
         setAlsaControl("ABOX SIFM2 Rate", "40000");
         setAlsaControl("ABOX SPUM ASRC2", "0");
-        setAlsaControl("ABOX WDMA2 Rate", "40000");
+        setAlsaControl("ABOX SPUM ASRC2 IS", "ABOX");
+        setAlsaControl("ABOX SPUM ASRC2 OS", "ABOX");
+        setAlsaControl("ABOX WDMA2 Rate", std::to_string(wdmaRate));
     }
     setAlsaControl("ABOX WDMA2 Width", "16");
     setAlsaControl("ABOX WDMA2 Channel", "2");
@@ -229,6 +231,7 @@ std::string enableFmAlsaRoute(bool useAsrc = true) {
         << "NSRC2=SPDY(" << (nsrc ? 1 : 0) << ") "
         << "SIFM2=WDMA(" << (sifm ? 1 : 0) << ") "
         << "SPDY_SW(" << (sw ? 1 : 0) << ") "
+        << "ASRC2(" << (useAsrc ? 1 : 0) << ") "
         << "VDAI4(" << (v4 ? 1 : 0) << ") "
         << "VDAI7(" << (v7 ? 1 : 0) << ")";
     return oss.str();
@@ -351,7 +354,7 @@ bool tryStreamSingleDevice(
     int pollTimeoutMs,
     std::string& detailMsg
 ) {
-    enableFmAlsaRoute(useAsrc);
+    enableFmAlsaRoute(useAsrc, reqRate > 0 ? reqRate : targetOutRate);
 
     char devPath[64];
     snprintf(devPath, sizeof(devPath), "/dev/snd/pcmC%dD%dc", card, dev);
@@ -403,7 +406,7 @@ bool tryStreamSingleDevice(
         struct snd_pcm_status st {};
         int stOk = ioctl(pcmFd, SNDRV_PCM_IOCTL_STATUS, &st);
         detailMsg = std::string(devPath) + "@" + std::to_string(actualRate) +
-                    " p=" + std::to_string(periodFrames) +
+                    "(asrc=" + (useAsrc ? "1" : "0") + ") p=" + std::to_string(periodFrames) +
                     (pr == 0 ? " poll_timeout" : " poll_err(" + std::to_string(pfd.revents) + ")") +
                     (stOk == 0 ? " st=" + std::to_string(st.state) : "");
         close(pcmFd);
@@ -415,19 +418,41 @@ bool tryStreamSingleDevice(
     std::vector<int16_t> outBuf;
 
     if (probeOnly) {
-        struct snd_xferi xfer {};
-        xfer.buf = inBuf.data();
-        xfer.frames = periodFrames;
-        if (ioctl(pcmFd, SNDRV_PCM_IOCTL_READI_FRAMES, &xfer) < 0) {
-            detailMsg = std::string(devPath) + "@" + std::to_string(actualRate) + " readi=" + strerror(errno);
-            close(pcmFd);
-            return false;
+        unsigned long totalFrames = 0;
+        int peakAbs = 0;
+        unsigned long nonZero = 0;
+        int readsOk = 0;
+        for (int r = 0; r < 3; ++r) {
+            struct snd_xferi xfer {};
+            xfer.buf = inBuf.data();
+            xfer.frames = periodFrames;
+            if (ioctl(pcmFd, SNDRV_PCM_IOCTL_READI_FRAMES, &xfer) < 0) {
+                detailMsg = std::string(devPath) + "@" + std::to_string(actualRate) +
+                            "(asrc=" + (useAsrc ? "1" : "0") + ") read#" + std::to_string(r) +
+                            "=" + strerror(errno) + " prevFrames=" + std::to_string(totalFrames);
+                close(pcmFd);
+                return false;
+            }
+            readsOk++;
+            totalFrames += static_cast<unsigned long>(xfer.result);
+            size_t samples = static_cast<size_t>(xfer.result) * channels;
+            for (size_t i = 0; i < samples; ++i) {
+                int s = inBuf[i];
+                int a = (s < 0) ? -s : s;
+                if (a > peakAbs) peakAbs = a;
+                if (a > 2) nonZero++;
+            }
         }
-        detailMsg = std::string(devPath) + "@" + std::to_string(actualRate) + " OK frames=" + std::to_string(xfer.result);
+        detailMsg = std::string(devPath) + "@" + std::to_string(actualRate) +
+                    "(asrc=" + (useAsrc ? "1" : "0") + ") OK reads=" + std::to_string(readsOk) +
+                    " frames=" + std::to_string(totalFrames) +
+                    " peak=" + std::to_string(peakAbs) +
+                    " nz=" + std::to_string(nonZero);
         close(pcmFd);
         return true;
     }
 
+    unsigned long totalFramesOut = 0;
     while (true) {
         struct snd_xferi xfer {};
         xfer.buf = inBuf.data();
@@ -438,16 +463,21 @@ bool tryStreamSingleDevice(
                 ioctl(pcmFd, SNDRV_PCM_IOCTL_START);
                 continue;
             }
-            detailMsg = std::string(devPath) + " readi=" + strerror(errno);
+            detailMsg = std::string(devPath) + " readi=" + strerror(errno) + " frames=" + std::to_string(totalFramesOut);
+            fprintf(stderr, "ERR %s\n", detailMsg.c_str());
             close(pcmFd);
             return false;
         }
         if (xfer.result <= 0) continue;
 
         size_t inFrames = static_cast<size_t>(xfer.result);
+        totalFramesOut += static_cast<unsigned long>(inFrames);
         if (actualRate == targetOutRate || actualRate == 0) {
             ssize_t written = write(STDOUT_FILENO, inBuf.data(), inFrames * frameBytes);
-            if (written <= 0) break;
+            if (written <= 0) {
+                fprintf(stderr, "STDOUT_END frames=%lu errno=%d\n", totalFramesOut, errno);
+                break;
+            }
         } else {
             size_t outFrames = (inFrames * targetOutRate) / actualRate;
             if (outFrames == 0) continue;
@@ -465,7 +495,10 @@ bool tryStreamSingleDevice(
                 }
             }
             ssize_t written = write(STDOUT_FILENO, outBuf.data(), outFrames * frameBytes);
-            if (written <= 0) break;
+            if (written <= 0) {
+                fprintf(stderr, "STDOUT_END frames=%lu errno=%d\n", totalFramesOut, errno);
+                break;
+            }
         }
     }
     close(pcmFd);
@@ -475,11 +508,11 @@ bool tryStreamSingleDevice(
 std::string probeAllFmCandidates(unsigned int targetRate) {
     struct Candidate { int card; int dev; unsigned int rate; bool asrc; };
     const std::vector<Candidate> candidates = {
+        {0, 114, targetRate, false},
         {0, 114, targetRate, true},
-        {0, 117, targetRate, true},
-        {0, 14, targetRate, true},
-        {0, 14, 40000, false},
-        {0, 19, targetRate, true}
+        {0, 117, targetRate, false},
+        {0, 14, targetRate, false},
+        {0, 14, 40000, false}
     };
     std::string summary;
     for (const auto& c : candidates) {
@@ -488,8 +521,7 @@ std::string probeAllFmCandidates(unsigned int targetRate) {
         if (!summary.empty()) summary += "; ";
         summary += msg;
     }
-    // Leave ASRC2 route active for follow-up LIST_FM_CTLS inspection
-    enableFmAlsaRoute(true);
+    enableFmAlsaRoute(false, targetRate);
     return summary;
 }
 
@@ -497,16 +529,16 @@ int runPcmCaptureStream(int card, int dev, unsigned int targetRate, unsigned int
     struct Candidate { int card; int dev; unsigned int rate; bool asrc; };
     std::vector<Candidate> candidates;
     if (card == 0 && dev == 14) {
-        // Urutan prioritas Exynos 850 ABOX: Calliope FE (VPCMIN_DAI4/7) -> WDMA2 48k -> WDMA2 40k native
+        // Urutan prioritas Exynos 850 ABOX sesuai mixer_paths.xml route-fm (ASRC2=0 -> fallback ASRC2=1)
         candidates = {
+            {0, 114, targetRate, false},
             {0, 114, targetRate, true},
-            {0, 117, targetRate, true},
-            {0, 14, targetRate, true},
-            {0, 14, 40000, false},
-            {0, 19, targetRate, true}
+            {0, 117, targetRate, false},
+            {0, 14, targetRate, false},
+            {0, 14, 40000, false}
         };
     } else {
-        candidates = { {card, dev, targetRate, true}, {card, dev, 40000, false} };
+        candidates = { {card, dev, targetRate, false}, {card, dev, targetRate, true}, {card, dev, 40000, false} };
     }
 
     std::string summary;
@@ -518,7 +550,7 @@ int runPcmCaptureStream(int card, int dev, unsigned int targetRate, unsigned int
         if (!summary.empty()) summary += "; ";
         summary += reason;
     }
-    enableFmAlsaRoute(true);
+    enableFmAlsaRoute(false, targetRate);
     fprintf(stderr, "ERR [%s]\n", summary.c_str());
     return 2;
 }
@@ -676,7 +708,7 @@ int main(int argc, char** argv) {
             }
         } else if (cmd == "ENABLE_FM_ALSA") {
 #if HAS_ALSA_UAPI
-            std::cout << enableFmAlsaRoute(true) << std::endl;
+            std::cout << enableFmAlsaRoute(false, 48000) << std::endl;
 #else
             std::cout << "ERR no_asound_h" << std::endl;
 #endif

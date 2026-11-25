@@ -35,9 +35,11 @@ import id.exynos850.fmradio.data.FmStationEntity
 import id.exynos850.fmradio.data.StationJsonExporter
 import id.exynos850.fmradio.nativebridge.FmNativeTuner
 import id.exynos850.fmradio.nativebridge.HardwareSignalInfo
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
@@ -91,10 +93,15 @@ class MainActivity : ComponentActivity() {
         val triggerBugReport: () -> Unit = {
             Toast.makeText(this@MainActivity, "Mengumpulkan probe & log...", Toast.LENGTH_SHORT).show()
             lifecycleScope.launch {
+                val statusText = buildString {
+                    append(tunerError ?: lastErrorHistory ?: "-")
+                    append(" | AudioEngine: ")
+                    append(audioEngine.lastStreamStats)
+                }
                 val (ok, msg) = fmTuner.generateAndSaveBugReport(
                     packageName = packageName,
                     nativeDiag = fmTuner.getDiagnosticReport(),
-                    extraStatus = tunerError ?: lastErrorHistory
+                    extraStatus = statusText
                 )
                 if (tunerError != null) {
                     diagnosticReport = msg
@@ -134,37 +141,50 @@ class MainActivity : ComponentActivity() {
             if (isPlaying) {
                 tunerError = null
                 diagnosticReport = null
-                if (fmTuner.open(allowRootFallback = true)) {
+                fmTuner.logEvent("Play pressed freq=$freqKhz")
+                val opened = withContext(Dispatchers.IO) { fmTuner.open(allowRootFallback = true) }
+                if (opened) {
                     isRootActive = fmTuner.isUsingRootMode()
-                    fmTuner.tuneManual(freqKhz)
-                    val alsaRouteStatus = fmTuner.enableFmAudioRoute()
-                    val rootFmPcm = fmTuner.detectRootFmPcm()
+                    fmTuner.logEvent("Tuner opened root=$isRootActive")
+                    val (alsaRouteStatus, rootFmPcm) = withContext(Dispatchers.IO) {
+                        fmTuner.tuneManual(freqKhz)
+                        val route = fmTuner.enableFmAudioRoute()
+                        val pcm = fmTuner.detectRootFmPcm()
+                        route to pcm
+                    }
+                    fmTuner.logEvent("Route=$alsaRouteStatus PCM=$rootFmPcm")
                     audioEngine.startAudioStream(
                         scope = lifecycleScope,
                         rootFmPcm = rootFmPcm,
                         rootDaemonPath = fmTuner.getRootDaemonBinaryPath(),
-                        alsaRouteStatus = alsaRouteStatus
+                        alsaRouteStatus = alsaRouteStatus,
+                        onLog = { m -> fmTuner.logEvent(m) }
                     ) { err ->
+                        fmTuner.logEvent("AudioError: $err")
                         tunerError = err
                         lastErrorHistory = err
                     }
                     while (isActive && isPlaying) {
-                        signal = fmTuner.readSignalMetrics()
+                        signal = withContext(Dispatchers.IO) { fmTuner.readSignalMetrics() }
                         delay(400)
                     }
                 } else {
                     isRootActive = false
                     val err = fmTuner.getLastError().ifBlank { "/dev/radio0 tidak dapat dibuka" }
+                    fmTuner.logEvent("Open failed: $err")
                     tunerError = err
                     lastErrorHistory = err
                     diagnosticReport = fmTuner.getDiagnosticReport()
                     isPlaying = false
                 }
             } else {
+                fmTuner.logEvent("Stopped playback")
                 isRootActive = false
                 audioEngine.stopAudioStream()
-                fmTuner.disableFmAudioRoute()
-                fmTuner.close()
+                withContext(Dispatchers.IO) {
+                    fmTuner.disableFmAudioRoute()
+                    fmTuner.close()
+                }
             }
         }
 
@@ -423,8 +443,11 @@ class MainActivity : ComponentActivity() {
                         Slider(
                             value = freqKhz.toFloat(),
                             onValueChange = {
-                                freqKhz = (((it.toInt() + stepKhz / 2) / stepKhz) * stepKhz).coerceIn(87500, 108000)
-                                if (isPlaying) fmTuner.tuneManual(freqKhz)
+                                val nextFreq = (((it.toInt() + stepKhz / 2) / stepKhz) * stepKhz).coerceIn(87500, 108000)
+                                freqKhz = nextFreq
+                                if (isPlaying) {
+                                    lifecycleScope.launch(Dispatchers.IO) { fmTuner.tuneManual(nextFreq) }
+                                }
                             },
                             valueRange = 87500f..108000f,
                             colors = SliderDefaults.colors(
@@ -444,8 +467,11 @@ class MainActivity : ComponentActivity() {
                     ) {
                         FilledTonalIconButton(
                             onClick = {
-                                freqKhz = (freqKhz - stepKhz).coerceAtLeast(87500)
-                                if (isPlaying) fmTuner.tuneManual(freqKhz)
+                                val nextFreq = (freqKhz - stepKhz).coerceAtLeast(87500)
+                                freqKhz = nextFreq
+                                if (isPlaying) {
+                                    lifecycleScope.launch(Dispatchers.IO) { fmTuner.tuneManual(nextFreq) }
+                                }
                             },
                             modifier = Modifier.size(48.dp),
                             shape = CircleShape
@@ -471,8 +497,11 @@ class MainActivity : ComponentActivity() {
 
                         FilledTonalIconButton(
                             onClick = {
-                                freqKhz = (freqKhz + stepKhz).coerceAtMost(108000)
-                                if (isPlaying) fmTuner.tuneManual(freqKhz)
+                                val nextFreq = (freqKhz + stepKhz).coerceAtMost(108000)
+                                freqKhz = nextFreq
+                                if (isPlaying) {
+                                    lifecycleScope.launch(Dispatchers.IO) { fmTuner.tuneManual(nextFreq) }
+                                }
                             },
                             modifier = Modifier.size(48.dp),
                             shape = CircleShape

@@ -31,6 +31,18 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
     private var rootWriter: BufferedWriter? = null
     private var rootReader: BufferedReader? = null
     private var rootLastError = ""
+    private val eventLog = ArrayDeque<String>()
+
+    @Synchronized
+    fun logEvent(msg: String) {
+        android.util.Log.i("A21sFm", msg)
+        val ts = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US).format(java.util.Date())
+        eventLog.addLast("$ts $msg")
+        while (eventLog.size > 40) eventLog.removeFirst()
+    }
+
+    @Synchronized
+    fun getEventLogText(): String = if (eventLog.isEmpty()) "-" else eventLog.joinToString("\n")
 
     @Synchronized
     private fun rootCommand(cmd: String): String {
@@ -287,10 +299,10 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
                 grep -rn -C 3 -iE "fm_tuner|RADIO_TUNER|FM" /vendor/etc/audio_policy* 2>/dev/null | head -n 40 || true
                 echo ""
                 echo "=== DMESG (s610/fm/abox/spdy/wdma2) ==="
-                dmesg 2>/dev/null | grep -iE "s610|14ac0000|spdy|wdma2|abox|asrc|vpcm|vdma|fm_" | tail -n 100 || true
+                dmesg 2>/dev/null | grep -iE "s610|14ac0000|spdy|wdma2|abox|asrc|vpcm|vdma|fm_" | tail -n 160 || true
                 echo ""
                 echo "=== LOGCAT (Audio/FM) ==="
-                logcat -d -t 150 2>/dev/null | grep -iE "A21sFm|AudioTrack|AudioFlinger|audio_hw|fm_" | tail -n 60 || true
+                logcat -d -t 200 2>/dev/null | grep -iE "A21sFm|AudioTrack|AudioFlinger|audio_hw|fm_" | tail -n 80 || true
             """.trimIndent()
             val proc = ProcessBuilder("su", "-c", script)
                 .redirectErrorStream(true)
@@ -305,6 +317,10 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
         val fullReport = buildString {
             appendLine("=== STATUS APLIKASI ===")
             appendLine("Error/Status: ${extraStatus ?: "-"}")
+            appendLine()
+            appendLine("=== APP EVENT LOG ===")
+            appendLine(getEventLogText())
+            appendLine()
             appendLine(liveProbeOutput)
             appendLine()
             append(collected)
