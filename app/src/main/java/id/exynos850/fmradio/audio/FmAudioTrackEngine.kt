@@ -12,6 +12,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class FmAudioTrackEngine(private val context: Context) {
 
@@ -103,7 +104,6 @@ class FmAudioTrackEngine(private val context: Context) {
                     pcmStreamProc = proc
                     applyRouting()
                     audioTrack?.setVolume(currentVolume)
-                    audioTrack?.play()
 
                     streamJob = scope.launch(Dispatchers.IO) {
                         val errBuf = StringBuilder()
@@ -119,9 +119,14 @@ class FmAudioTrackEngine(private val context: Context) {
                         val byteBuf = ByteArray(3840)
                         val input = proc.inputStream
                         var totalWritten = 0L
+                        var playbackStarted = false
                         while (isActive) {
                             val readBytes = input.read(byteBuf)
                             if (readBytes <= 0) break
+                            if (!playbackStarted) {
+                                audioTrack?.play()
+                                playbackStarted = true
+                            }
                             audioTrack?.write(byteBuf, 0, readBytes, AudioTrack.WRITE_BLOCKING)
                             totalWritten += readBytes
                         }
@@ -129,7 +134,9 @@ class FmAudioTrackEngine(private val context: Context) {
                         if (isActive && totalWritten == 0L) {
                             val stderrText = errBuf.toString().trim().ifBlank { "EOF tanpa data" }
                             releaseAudioHandles()
-                            onError("Stream ALSA pcmC${card}D${dev}c kosong ($stderrText) | Route: $alsaRouteStatus")
+                            withContext(Dispatchers.Main) {
+                                onError("Stream ALSA pcmC${card}D${dev}c kosong ($stderrText) | Route: $alsaRouteStatus")
+                            }
                         }
                     }
                     return

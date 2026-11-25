@@ -82,17 +82,19 @@ class MainActivity : ComponentActivity() {
         var signal by remember { mutableStateOf(HardwareSignalInfo(-104, 0, false, 0)) }
         var stations by remember { mutableStateOf(dbHelper.getAllStations()) }
         var tunerError by remember { mutableStateOf<String?>(null) }
+        var lastErrorHistory by remember { mutableStateOf<String?>(null) }
         var diagnosticReport by remember { mutableStateOf<String?>(null) }
         var isRootActive by remember { mutableStateOf(false) }
 
         val activeStation = stations.firstOrNull { it.frequencyKhz == freqKhz }
 
         val triggerBugReport: () -> Unit = {
+            Toast.makeText(this@MainActivity, "Mengumpulkan probe & log...", Toast.LENGTH_SHORT).show()
             lifecycleScope.launch {
                 val (ok, msg) = fmTuner.generateAndSaveBugReport(
                     packageName = packageName,
                     nativeDiag = fmTuner.getDiagnosticReport(),
-                    extraStatus = tunerError
+                    extraStatus = tunerError ?: lastErrorHistory
                 )
                 if (tunerError != null) {
                     diagnosticReport = msg
@@ -144,6 +146,7 @@ class MainActivity : ComponentActivity() {
                         alsaRouteStatus = alsaRouteStatus
                     ) { err ->
                         tunerError = err
+                        lastErrorHistory = err
                     }
                     while (isActive && isPlaying) {
                         signal = fmTuner.readSignalMetrics()
@@ -151,7 +154,9 @@ class MainActivity : ComponentActivity() {
                     }
                 } else {
                     isRootActive = false
-                    tunerError = fmTuner.getLastError().ifBlank { "/dev/radio0 tidak dapat dibuka" }
+                    val err = fmTuner.getLastError().ifBlank { "/dev/radio0 tidak dapat dibuka" }
+                    tunerError = err
+                    lastErrorHistory = err
                     diagnosticReport = fmTuner.getDiagnosticReport()
                     isPlaying = false
                 }

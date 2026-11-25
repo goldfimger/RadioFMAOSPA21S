@@ -224,21 +224,51 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
         extraStatus: String?
     ): Pair<Boolean, String> = withContext(Dispatchers.IO) {
         val targetPath = "/sdcard/A21s_FM_BugReport.txt"
-        val alsaCtls = if (usingRootDaemon) {
-            rootCommand("LIST_FM_CTLS")
+        val liveProbeOutput = if (usingRootDaemon) {
+            val pcmDetect = rootCommand("DETECT_FM_PCM")
+            val v4l2Ctls = rootCommand("LIST_V4L2_CTLS")
+            val probeAudio = rootCommand("PROBE_FM_AUDIO")
+            val alsaCtls = rootCommand("LIST_FM_CTLS")
+            """
+                DETECT_FM_PCM: $pcmDetect
+                PROBE_FM_AUDIO: $probeAudio
+
+                === V4L2 CONTROLS (/dev/radio0) ===
+                $v4l2Ctls
+
+                === ALSA CONTROLS (LIST_FM_CTLS) ===
+                $alsaCtls
+            """.trimIndent()
         } else {
             runCatching {
                 val bin = getRootDaemonBinaryPath()
                 val p = ProcessBuilder("su", "-c", bin).redirectErrorStream(true).start()
                 p.outputStream.bufferedWriter().use { w ->
-                    w.write("LIST_FM_CTLS\nCLOSE\n")
+                    w.write("OPEN\nTUNE 98700\nLIST_V4L2_CTLS\nDETECT_FM_PCM\nPROBE_FM_AUDIO\nLIST_FM_CTLS\nCLOSE\n")
                     w.flush()
                 }
-                p.inputStream.bufferedReader().readText().trim()
-            }.getOrDefault("Daemon root belum berjalan")
+                val lines = p.inputStream.bufferedReader().readLines()
+                val openResp = lines.getOrNull(0) ?: "-"
+                val tuneResp = lines.getOrNull(1) ?: "-"
+                val v4l2Resp = lines.getOrNull(2) ?: "-"
+                val detectResp = lines.getOrNull(3) ?: "-"
+                val probeResp = lines.getOrNull(4) ?: "-"
+                val alsaResp = lines.getOrNull(5) ?: "-"
+                """
+                    OPEN: $openResp | TUNE(98700): $tuneResp
+                    DETECT_FM_PCM: $detectResp
+                    PROBE_FM_AUDIO: $probeResp
+
+                    === V4L2 CONTROLS (/dev/radio0) ===
+                    $v4l2Resp
+
+                    === ALSA CONTROLS (LIST_FM_CTLS) ===
+                    $alsaResp
+                """.trimIndent()
+            }.getOrElse { ex ->
+                "Gagal menjalankan probe root: ${ex.message}"
+            }
         }
-        val pcmDetect = if (usingRootDaemon) rootCommand("DETECT_FM_PCM") else "Daemon root belum berjalan"
-        val v4l2Ctls = if (usingRootDaemon) rootCommand("LIST_V4L2_CTLS") else "Daemon root belum berjalan"
 
         val collected = runCatching {
             val script = """
@@ -248,14 +278,19 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
                 echo "Android: $(getprop ro.build.version.release) | SDK: $(getprop ro.build.version.sdk)"
                 echo "Kernel: $(uname -a)"
                 echo ""
-                echo "=== MIXER PATHS (route-wdma2 & fm_radio) ==="
-                sed -n '315,380p;1175,1230p' /vendor/etc/mixer_paths.xml 2>/dev/null || true
+                echo "=== MIXER PATHS (spdy/fm_radio/route-fm/wdma2) ==="
+                sed -n '1,120p' /vendor/etc/mixer_paths.xml 2>/dev/null || true
+                echo "---"
+                grep -n -C 4 -iE "spdy|route-fm|fm_radio|wdma2|sifm2|nsrc2|vpcmindai4|vpcmindai7|bd_srccom6" /vendor/etc/mixer_paths.xml 2>/dev/null || true
+                echo ""
+                echo "=== AUDIO POLICY (fm/radio_tuner) ==="
+                grep -rn -C 3 -iE "fm_tuner|RADIO_TUNER|FM" /vendor/etc/audio_policy* 2>/dev/null | head -n 40 || true
                 echo ""
                 echo "=== DMESG (s610/fm/abox/spdy/wdma2) ==="
-                dmesg 2>/dev/null | grep -iE "s610|14ac0000|spdy|wdma2|abox|asrc|vpcm|fm_" | tail -n 60 || true
+                dmesg 2>/dev/null | grep -iE "s610|14ac0000|spdy|wdma2|abox|asrc|vpcm|vdma|fm_" | tail -n 100 || true
                 echo ""
                 echo "=== LOGCAT (Audio/FM) ==="
-                logcat -d -t 120 2>/dev/null | grep -iE "A21sFm|AudioTrack|AudioFlinger|audio_hw|fm_" | tail -n 50 || true
+                logcat -d -t 150 2>/dev/null | grep -iE "A21sFm|AudioTrack|AudioFlinger|audio_hw|fm_" | tail -n 60 || true
             """.trimIndent()
             val proc = ProcessBuilder("su", "-c", script)
                 .redirectErrorStream(true)
@@ -270,13 +305,7 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
         val fullReport = buildString {
             appendLine("=== STATUS APLIKASI ===")
             appendLine("Error/Status: ${extraStatus ?: "-"}")
-            appendLine("DETECT_FM_PCM: $pcmDetect")
-            appendLine()
-            appendLine("=== V4L2 CONTROLS (/dev/radio0) ===")
-            appendLine(v4l2Ctls)
-            appendLine()
-            appendLine("=== ALSA CONTROLS (LIST_FM_CTLS) ===")
-            appendLine(alsaCtls)
+            appendLine(liveProbeOutput)
             appendLine()
             append(collected)
         }

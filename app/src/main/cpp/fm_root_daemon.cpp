@@ -249,31 +249,33 @@ void listV4l2Controls(int fd) {
         return;
     }
     std::ostringstream oss;
-    struct v4l2_queryctrl q {};
-    q.id = V4L2_CTRL_FLAG_NEXT_CTRL;
     int count = 0;
-    while (ioctl(fd, VIDIOC_QUERYCTRL, &q) == 0 && count < 64) {
+    auto appendCtrl = [&](const struct v4l2_queryctrl& q) {
         struct v4l2_control c {};
         c.id = q.id;
         int val = (ioctl(fd, VIDIOC_G_CTRL, &c) == 0) ? c.value : -999999;
         if (count > 0) oss << "; ";
-        oss << q.name << "(0x" << std::hex << q.id << std::dec << ")=" << val
+        oss << reinterpret_cast<const char*>(q.name)
+            << "(0x" << std::hex << q.id << std::dec << ")=" << val
             << "[" << q.minimum << ".." << q.maximum << "]";
-        q.id |= V4L2_CTRL_FLAG_NEXT_CTRL;
         count++;
+    };
+
+    struct v4l2_queryctrl q {};
+    q.id = V4L2_CTRL_FLAG_NEXT_CTRL;
+    while (ioctl(fd, VIDIOC_QUERYCTRL, &q) == 0 && count < 64) {
+        appendCtrl(q);
+        q.id |= V4L2_CTRL_FLAG_NEXT_CTRL;
     }
-    for (__u32 id = V4L2_CID_PRIVATE_BASE; id < V4L2_CID_PRIVATE_BASE + 24; ++id) {
+    for (__u32 id = V4L2_CID_AUDIO_VOLUME; id <= V4L2_CID_AUDIO_LOUDNESS + 8; ++id) {
+        struct v4l2_queryctrl aq {};
+        aq.id = id;
+        if (ioctl(fd, VIDIOC_QUERYCTRL, &aq) == 0) appendCtrl(aq);
+    }
+    for (__u32 id = V4L2_CID_PRIVATE_BASE; id < V4L2_CID_PRIVATE_BASE + 32; ++id) {
         struct v4l2_queryctrl pq {};
         pq.id = id;
-        if (ioctl(fd, VIDIOC_QUERYCTRL, &pq) == 0) {
-            struct v4l2_control c {};
-            c.id = id;
-            int val = (ioctl(fd, VIDIOC_G_CTRL, &c) == 0) ? c.value : -999999;
-            if (count > 0) oss << "; ";
-            oss << pq.name << "(0x" << std::hex << id << std::dec << ")=" << val
-                << "[" << pq.minimum << ".." << pq.maximum << "]";
-            count++;
-        }
+        if (ioctl(fd, VIDIOC_QUERYCTRL, &pq) == 0) appendCtrl(pq);
     }
     std::cout << "OK " << (count > 0 ? oss.str() : "no_v4l2_ctrls") << std::endl;
 }
@@ -282,6 +284,10 @@ bool configureHwParams(
     int pcmFd,
     unsigned int reqRate,
     unsigned int channels,
+    unsigned int minPeriodFrames,
+    unsigned int maxPeriodFrames,
+    unsigned int minPeriods,
+    unsigned int maxPeriods,
     unsigned int& outRate,
     unsigned int& outPeriodFrames,
     unsigned int& outBufferFrames
@@ -318,8 +324,8 @@ bool configureHwParams(
     } else {
         setInterval(SNDRV_PCM_HW_PARAM_RATE, 8000, 96000);
     }
-    setInterval(SNDRV_PCM_HW_PARAM_PERIOD_SIZE, 240, 4096);
-    setInterval(SNDRV_PCM_HW_PARAM_PERIODS, 2, 16);
+    setInterval(SNDRV_PCM_HW_PARAM_PERIOD_SIZE, minPeriodFrames, maxPeriodFrames);
+    setInterval(SNDRV_PCM_HW_PARAM_PERIODS, minPeriods, maxPeriods);
 
     if (ioctl(pcmFd, SNDRV_PCM_IOCTL_HW_PARAMS, &params) < 0) {
         return false;
@@ -328,7 +334,7 @@ bool configureHwParams(
     outRate = params.intervals[SNDRV_PCM_HW_PARAM_RATE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min;
     outPeriodFrames = params.intervals[SNDRV_PCM_HW_PARAM_PERIOD_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min;
     outBufferFrames = params.intervals[SNDRV_PCM_HW_PARAM_BUFFER_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min;
-    if (outPeriodFrames < 64 || outPeriodFrames > 8192) outPeriodFrames = 960;
+    if (outPeriodFrames < 64 || outPeriodFrames > 8192) outPeriodFrames = 240;
     if (outBufferFrames < outPeriodFrames * 2) outBufferFrames = outPeriodFrames * 4;
     if (outRate == 0) outRate = reqRate > 0 ? reqRate : 48000;
     return true;
@@ -341,7 +347,9 @@ bool tryStreamSingleDevice(
     unsigned int targetOutRate,
     unsigned int channels,
     bool useAsrc,
-    std::string& failReason
+    bool probeOnly,
+    int pollTimeoutMs,
+    std::string& detailMsg
 ) {
     enableFmAlsaRoute(useAsrc);
 
@@ -350,20 +358,22 @@ bool tryStreamSingleDevice(
     int pcmFd = open(devPath, O_RDWR);
     if (pcmFd < 0) pcmFd = open(devPath, O_RDONLY);
     if (pcmFd < 0) {
-        failReason = std::string(devPath) + " open=" + strerror(errno);
+        detailMsg = std::string(devPath) + " open=" + strerror(errno);
         return false;
     }
 
     unsigned int actualRate = reqRate;
-    unsigned int periodFrames = 960;
-    unsigned int bufferFrames = 3840;
-    if (!configureHwParams(pcmFd, reqRate, channels, actualRate, periodFrames, bufferFrames)) {
+    unsigned int periodFrames = 240;
+    unsigned int bufferFrames = 960;
+    // Prefer PrdSz=240 #Prds=2..8 (matching samsung-abox-vdma), then fallback broader range
+    bool hwOk = configureHwParams(pcmFd, reqRate, channels, 240, 240, 2, 8, actualRate, periodFrames, bufferFrames) ||
+                configureHwParams(pcmFd, reqRate, channels, 240, 4096, 2, 16, actualRate, periodFrames, bufferFrames) ||
+                (reqRate != 0 && configureHwParams(pcmFd, 0, channels, 240, 4096, 2, 16, actualRate, periodFrames, bufferFrames));
+    if (!hwOk) {
         int err1 = errno;
-        if (reqRate == 0 || !configureHwParams(pcmFd, 0, channels, actualRate, periodFrames, bufferFrames)) {
-            failReason = std::string(devPath) + "@" + std::to_string(reqRate) + " hw_params=" + strerror(err1);
-            close(pcmFd);
-            return false;
-        }
+        detailMsg = std::string(devPath) + "@" + std::to_string(reqRate) + " hw_params=" + strerror(err1);
+        close(pcmFd);
+        return false;
     }
 
     struct snd_pcm_sw_params sw {};
@@ -375,24 +385,27 @@ bool tryStreamSingleDevice(
     ioctl(pcmFd, SNDRV_PCM_IOCTL_SW_PARAMS, &sw);
 
     if (ioctl(pcmFd, SNDRV_PCM_IOCTL_PREPARE) < 0) {
-        failReason = std::string(devPath) + " prepare=" + strerror(errno);
+        detailMsg = std::string(devPath) + " prepare=" + strerror(errno);
         close(pcmFd);
         return false;
     }
     if (ioctl(pcmFd, SNDRV_PCM_IOCTL_START) < 0 && errno != EBADFD && errno != EISCONN) {
-        failReason = std::string(devPath) + " start=" + strerror(errno);
+        detailMsg = std::string(devPath) + " start=" + strerror(errno);
         close(pcmFd);
         return false;
     }
 
-    // Tunggu maks 1500ms agar node mati tidak memblokir 10 detik
     struct pollfd pfd {};
     pfd.fd = pcmFd;
     pfd.events = POLLIN | POLLERR | POLLHUP;
-    int pr = poll(&pfd, 1, 1500);
+    int pr = poll(&pfd, 1, pollTimeoutMs);
     if (pr <= 0 || (pfd.revents & (POLLERR | POLLHUP)) != 0) {
-        failReason = std::string(devPath) + "@" + std::to_string(actualRate) +
-                     (pr == 0 ? " poll_timeout_1500ms" : " poll_err");
+        struct snd_pcm_status st {};
+        int stOk = ioctl(pcmFd, SNDRV_PCM_IOCTL_STATUS, &st);
+        detailMsg = std::string(devPath) + "@" + std::to_string(actualRate) +
+                    " p=" + std::to_string(periodFrames) +
+                    (pr == 0 ? " poll_timeout" : " poll_err(" + std::to_string(pfd.revents) + ")") +
+                    (stOk == 0 ? " st=" + std::to_string(st.state) : "");
         close(pcmFd);
         return false;
     }
@@ -400,6 +413,20 @@ bool tryStreamSingleDevice(
     size_t frameBytes = static_cast<size_t>(channels) * 2;
     std::vector<int16_t> inBuf(periodFrames * channels);
     std::vector<int16_t> outBuf;
+
+    if (probeOnly) {
+        struct snd_xferi xfer {};
+        xfer.buf = inBuf.data();
+        xfer.frames = periodFrames;
+        if (ioctl(pcmFd, SNDRV_PCM_IOCTL_READI_FRAMES, &xfer) < 0) {
+            detailMsg = std::string(devPath) + "@" + std::to_string(actualRate) + " readi=" + strerror(errno);
+            close(pcmFd);
+            return false;
+        }
+        detailMsg = std::string(devPath) + "@" + std::to_string(actualRate) + " OK frames=" + std::to_string(xfer.result);
+        close(pcmFd);
+        return true;
+    }
 
     while (true) {
         struct snd_xferi xfer {};
@@ -411,7 +438,7 @@ bool tryStreamSingleDevice(
                 ioctl(pcmFd, SNDRV_PCM_IOCTL_START);
                 continue;
             }
-            failReason = std::string(devPath) + " readi=" + strerror(errno);
+            detailMsg = std::string(devPath) + " readi=" + strerror(errno);
             close(pcmFd);
             return false;
         }
@@ -445,6 +472,27 @@ bool tryStreamSingleDevice(
     return true;
 }
 
+std::string probeAllFmCandidates(unsigned int targetRate) {
+    struct Candidate { int card; int dev; unsigned int rate; bool asrc; };
+    const std::vector<Candidate> candidates = {
+        {0, 114, targetRate, true},
+        {0, 117, targetRate, true},
+        {0, 14, targetRate, true},
+        {0, 14, 40000, false},
+        {0, 19, targetRate, true}
+    };
+    std::string summary;
+    for (const auto& c : candidates) {
+        std::string msg;
+        tryStreamSingleDevice(c.card, c.dev, c.rate, targetRate, 2, c.asrc, true, 450, msg);
+        if (!summary.empty()) summary += "; ";
+        summary += msg;
+    }
+    // Leave ASRC2 route active for follow-up LIST_FM_CTLS inspection
+    enableFmAlsaRoute(true);
+    return summary;
+}
+
 int runPcmCaptureStream(int card, int dev, unsigned int targetRate, unsigned int channels) {
     struct Candidate { int card; int dev; unsigned int rate; bool asrc; };
     std::vector<Candidate> candidates;
@@ -464,12 +512,13 @@ int runPcmCaptureStream(int card, int dev, unsigned int targetRate, unsigned int
     std::string summary;
     for (const auto& c : candidates) {
         std::string reason;
-        if (tryStreamSingleDevice(c.card, c.dev, c.rate, targetRate, channels, c.asrc, reason)) {
+        if (tryStreamSingleDevice(c.card, c.dev, c.rate, targetRate, channels, c.asrc, false, 800, reason)) {
             return 0;
         }
         if (!summary.empty()) summary += "; ";
         summary += reason;
     }
+    enableFmAlsaRoute(true);
     fprintf(stderr, "ERR [%s]\n", summary.c_str());
     return 2;
 }
@@ -646,6 +695,12 @@ int main(int argc, char** argv) {
 #endif
         } else if (cmd == "LIST_V4L2_CTLS") {
             listV4l2Controls(gFd);
+        } else if (cmd == "PROBE_FM_AUDIO") {
+#if HAS_ALSA_UAPI
+            std::cout << probeAllFmCandidates(48000) << std::endl;
+#else
+            std::cout << "ERR no_asound_h" << std::endl;
+#endif
         } else if (cmd == "SET_CTL") {
             std::string rest;
             std::getline(iss >> std::ws, rest);
