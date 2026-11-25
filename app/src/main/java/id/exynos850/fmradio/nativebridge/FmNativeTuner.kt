@@ -238,6 +238,7 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
             }.getOrDefault("Daemon root belum berjalan")
         }
         val pcmDetect = if (usingRootDaemon) rootCommand("DETECT_FM_PCM") else "Daemon root belum berjalan"
+        val v4l2Ctls = if (usingRootDaemon) rootCommand("LIST_V4L2_CTLS") else "Daemon root belum berjalan"
 
         val collected = runCatching {
             val script = """
@@ -247,18 +248,14 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
                 echo "Android: $(getprop ro.build.version.release) | SDK: $(getprop ro.build.version.sdk)"
                 echo "Kernel: $(uname -a)"
                 echo ""
-                echo "=== PACKAGE DUMPSYS ==="
-                dumpsys package $packageName 2>/dev/null | grep -E "codePath=|pkgFlags=|ACCESS_FM_RADIO" || true
+                echo "=== MIXER PATHS (route-wdma2 & fm_radio) ==="
+                sed -n '315,380p;1175,1230p' /vendor/etc/mixer_paths.xml 2>/dev/null || true
                 echo ""
-                echo "=== DEV & SYSFS RADIO ==="
-                ls -lZ /dev/radio* /dev/fm* /sys/class/video4linux/radio* 2>&1 || true
-                echo ""
-                echo "=== /proc/asound/cards & pcm (Card 0) ==="
-                cat /proc/asound/cards 2>&1 || true
-                grep -E "^00-" /proc/asound/pcm 2>&1 || true
+                echo "=== DMESG (s610/fm/abox/spdy/wdma2) ==="
+                dmesg 2>/dev/null | grep -iE "s610|14ac0000|spdy|wdma2|abox|asrc|vpcm|fm_" | tail -n 60 || true
                 echo ""
                 echo "=== LOGCAT (Audio/FM) ==="
-                logcat -d -t 120 2>/dev/null | grep -iE "A21sFm|AudioTrack|AudioFlinger|audio_hw|fm_" | tail -n 60 || true
+                logcat -d -t 120 2>/dev/null | grep -iE "A21sFm|AudioTrack|AudioFlinger|audio_hw|fm_" | tail -n 50 || true
             """.trimIndent()
             val proc = ProcessBuilder("su", "-c", script)
                 .redirectErrorStream(true)
@@ -275,8 +272,8 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
             appendLine("Error/Status: ${extraStatus ?: "-"}")
             appendLine("DETECT_FM_PCM: $pcmDetect")
             appendLine()
-            appendLine("=== NATIVE DIAGNOSTIC ===")
-            appendLine(nativeDiag.ifBlank { "-" })
+            appendLine("=== V4L2 CONTROLS (/dev/radio0) ===")
+            appendLine(v4l2Ctls)
             appendLine()
             appendLine("=== ALSA CONTROLS (LIST_FM_CTLS) ===")
             appendLine(alsaCtls)

@@ -111,7 +111,7 @@ class FmAudioTrackEngine(private val context: Context) {
                             runCatching {
                                 proc.errorStream.bufferedReader().useLines { lines ->
                                     lines.forEach { line ->
-                                        if (errBuf.length < 512) errBuf.appendLine(line)
+                                        if (errBuf.length < 2048) errBuf.appendLine(line)
                                     }
                                 }
                             }

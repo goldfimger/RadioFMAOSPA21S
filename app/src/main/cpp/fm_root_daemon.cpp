@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <sys/ioctl.h>
+#include <poll.h>
 #include <linux/videodev2.h>
 #if __has_include(<sound/asound.h>)
 #include <sound/asound.h>
@@ -95,7 +96,10 @@ void listFmAlsaControls() {
             lower.find("nsrc") == std::string::npos &&
             lower.find("sifs") == std::string::npos &&
             lower.find("spum") == std::string::npos &&
-            lower.find("wdma2") == std::string::npos) {
+            lower.find("wdma2") == std::string::npos &&
+            lower.find("vpcmin_dai4") == std::string::npos &&
+            lower.find("vpcmin_dai7") == std::string::npos &&
+            lower.find("bd_srccom6") == std::string::npos) {
             continue;
         }
         struct snd_ctl_elem_info info {};
@@ -193,36 +197,85 @@ bool setAlsaControl(const std::string& ctlName, const std::string& ctlVal) {
     return ok;
 }
 
-std::string enableFmAlsaRoute() {
+std::string enableFmAlsaRoute(bool useAsrc = true) {
     // Sesuai /vendor/etc/mixer_paths.xml Exynos 850:
-    // <path name="route-fm"> -> ABOX NSRC2=SPDY, ABOX SIFM2=WDMA, ABOX SPDY Rate=40000
-    // Ditambah ABOX SPUM ASRC2=1 untuk sinkronisasi 40kHz SPDY -> 48kHz WDMA2.
+    // <path name="route-fm"> -> NSRC2=SPDY, SIFM2=WDMA, WDMA2->VPCMIN_DAI4 & VPCMIN_DAI7
     bool sw = setAlsaControl("ABOX SPDY CAP SPDY Switch", "1");
     setAlsaControl("ABOX SPDY Rate", "40000");
     setAlsaControl("ABOX SPDY Width", "16");
     setAlsaControl("ABOX SPDY Channel", "2");
     bool nsrc = setAlsaControl("ABOX NSRC2", "SPDY");
     bool sifm = setAlsaControl("ABOX SIFM2", "WDMA");
-    setAlsaControl("ABOX SIFM2 Rate", "48000");
     setAlsaControl("ABOX SIFM2 Width", "16");
-    bool asrc = setAlsaControl("ABOX SPUM ASRC2", "1");
+    if (useAsrc) {
+        setAlsaControl("ABOX SIFM2 Rate", "48000");
+        setAlsaControl("ABOX SPUM ASRC2 IS", "BCLK_SPDY");
+        setAlsaControl("ABOX SPUM ASRC2 OS", "ABOX");
+        setAlsaControl("ABOX SPUM ASRC2", "1");
+        setAlsaControl("ABOX WDMA2 Rate", "48000");
+    } else {
+        setAlsaControl("ABOX SIFM2 Rate", "40000");
+        setAlsaControl("ABOX SPUM ASRC2", "0");
+        setAlsaControl("ABOX WDMA2 Rate", "40000");
+    }
     setAlsaControl("ABOX WDMA2 Width", "16");
     setAlsaControl("ABOX WDMA2 Channel", "2");
-    setAlsaControl("ABOX WDMA2 Rate", "48000");
     setAlsaControl("ABOX WDMA2 Period", "240");
+    bool v4 = setAlsaControl("ABOX VPCMIN_DAI4_A", "WDMA2") || setAlsaControl("ABOX VPCMIN_DAI4_B", "WDMA2");
+    bool v7 = setAlsaControl("ABOX VPCMIN_DAI7_A", "WDMA2") || setAlsaControl("ABOX VPCMIN_DAI7_B", "WDMA2");
 
     std::ostringstream oss;
     oss << (nsrc ? "OK " : "ERR ")
         << "NSRC2=SPDY(" << (nsrc ? 1 : 0) << ") "
         << "SIFM2=WDMA(" << (sifm ? 1 : 0) << ") "
         << "SPDY_SW(" << (sw ? 1 : 0) << ") "
-        << "ASRC2(" << (asrc ? 1 : 0) << ")";
+        << "VDAI4(" << (v4 ? 1 : 0) << ") "
+        << "VDAI7(" << (v7 ? 1 : 0) << ")";
     return oss.str();
 }
 
 void disableFmAlsaRoute() {
     setAlsaControl("ABOX NSRC2", "RESERVED");
     setAlsaControl("ABOX SPUM ASRC2", "0");
+    setAlsaControl("ABOX VPCMIN_DAI4_A", "None");
+    setAlsaControl("ABOX VPCMIN_DAI4_B", "None");
+    setAlsaControl("ABOX VPCMIN_DAI7_A", "None");
+    setAlsaControl("ABOX VPCMIN_DAI7_B", "None");
+}
+
+void listV4l2Controls(int fd) {
+    if (fd < 0) {
+        std::cout << "ERR radio_not_open" << std::endl;
+        return;
+    }
+    std::ostringstream oss;
+    struct v4l2_queryctrl q {};
+    q.id = V4L2_CTRL_FLAG_NEXT_CTRL;
+    int count = 0;
+    while (ioctl(fd, VIDIOC_QUERYCTRL, &q) == 0 && count < 64) {
+        struct v4l2_control c {};
+        c.id = q.id;
+        int val = (ioctl(fd, VIDIOC_G_CTRL, &c) == 0) ? c.value : -999999;
+        if (count > 0) oss << "; ";
+        oss << q.name << "(0x" << std::hex << q.id << std::dec << ")=" << val
+            << "[" << q.minimum << ".." << q.maximum << "]";
+        q.id |= V4L2_CTRL_FLAG_NEXT_CTRL;
+        count++;
+    }
+    for (__u32 id = V4L2_CID_PRIVATE_BASE; id < V4L2_CID_PRIVATE_BASE + 24; ++id) {
+        struct v4l2_queryctrl pq {};
+        pq.id = id;
+        if (ioctl(fd, VIDIOC_QUERYCTRL, &pq) == 0) {
+            struct v4l2_control c {};
+            c.id = id;
+            int val = (ioctl(fd, VIDIOC_G_CTRL, &c) == 0) ? c.value : -999999;
+            if (count > 0) oss << "; ";
+            oss << pq.name << "(0x" << std::hex << id << std::dec << ")=" << val
+                << "[" << pq.minimum << ".." << pq.maximum << "]";
+            count++;
+        }
+    }
+    std::cout << "OK " << (count > 0 ? oss.str() : "no_v4l2_ctrls") << std::endl;
 }
 
 bool configureHwParams(
@@ -281,32 +334,35 @@ bool configureHwParams(
     return true;
 }
 
-int runPcmCaptureStream(int card, int dev, unsigned int targetRate, unsigned int channels) {
-    // Pastikan route ALSA Exynos ABOX aktif sebelum membuka WDMA2
-    enableFmAlsaRoute();
+bool tryStreamSingleDevice(
+    int card,
+    int dev,
+    unsigned int reqRate,
+    unsigned int targetOutRate,
+    unsigned int channels,
+    bool useAsrc,
+    std::string& failReason
+) {
+    enableFmAlsaRoute(useAsrc);
 
     char devPath[64];
     snprintf(devPath, sizeof(devPath), "/dev/snd/pcmC%dD%dc", card, dev);
     int pcmFd = open(devPath, O_RDWR);
+    if (pcmFd < 0) pcmFd = open(devPath, O_RDONLY);
     if (pcmFd < 0) {
-        pcmFd = open(devPath, O_RDONLY);
-    }
-    if (pcmFd < 0) {
-        fprintf(stderr, "ERR open %s: %s (errno=%d)\n", devPath, strerror(errno), errno);
-        return 1;
+        failReason = std::string(devPath) + " open=" + strerror(errno);
+        return false;
     }
 
-    unsigned int actualRate = targetRate;
+    unsigned int actualRate = reqRate;
     unsigned int periodFrames = 960;
     unsigned int bufferFrames = 3840;
-
-    if (!configureHwParams(pcmFd, targetRate, channels, actualRate, periodFrames, bufferFrames)) {
+    if (!configureHwParams(pcmFd, reqRate, channels, actualRate, periodFrames, bufferFrames)) {
         int err1 = errno;
-        if (!configureHwParams(pcmFd, 40000, channels, actualRate, periodFrames, bufferFrames) &&
-            !configureHwParams(pcmFd, 0, channels, actualRate, periodFrames, bufferFrames)) {
-            fprintf(stderr, "ERR hw_params %s (rate=%u): %s (errno=%d)\n", devPath, targetRate, strerror(err1), err1);
+        if (reqRate == 0 || !configureHwParams(pcmFd, 0, channels, actualRate, periodFrames, bufferFrames)) {
+            failReason = std::string(devPath) + "@" + std::to_string(reqRate) + " hw_params=" + strerror(err1);
             close(pcmFd);
-            return 2;
+            return false;
         }
     }
 
@@ -316,16 +372,30 @@ int runPcmCaptureStream(int card, int dev, unsigned int targetRate, unsigned int
     sw.avail_min = periodFrames;
     sw.start_threshold = 1;
     sw.stop_threshold = bufferFrames;
-    sw.silence_threshold = 0;
-    sw.silence_size = 0;
     ioctl(pcmFd, SNDRV_PCM_IOCTL_SW_PARAMS, &sw);
 
     if (ioctl(pcmFd, SNDRV_PCM_IOCTL_PREPARE) < 0) {
-        fprintf(stderr, "ERR prepare %s: %s (errno=%d)\n", devPath, strerror(errno), errno);
+        failReason = std::string(devPath) + " prepare=" + strerror(errno);
         close(pcmFd);
-        return 3;
+        return false;
     }
-    ioctl(pcmFd, SNDRV_PCM_IOCTL_START);
+    if (ioctl(pcmFd, SNDRV_PCM_IOCTL_START) < 0 && errno != EBADFD && errno != EISCONN) {
+        failReason = std::string(devPath) + " start=" + strerror(errno);
+        close(pcmFd);
+        return false;
+    }
+
+    // Tunggu maks 1500ms agar node mati tidak memblokir 10 detik
+    struct pollfd pfd {};
+    pfd.fd = pcmFd;
+    pfd.events = POLLIN | POLLERR | POLLHUP;
+    int pr = poll(&pfd, 1, 1500);
+    if (pr <= 0 || (pfd.revents & (POLLERR | POLLHUP)) != 0) {
+        failReason = std::string(devPath) + "@" + std::to_string(actualRate) +
+                     (pr == 0 ? " poll_timeout_1500ms" : " poll_err");
+        close(pcmFd);
+        return false;
+    }
 
     size_t frameBytes = static_cast<size_t>(channels) * 2;
     std::vector<int16_t> inBuf(periodFrames * channels);
@@ -341,22 +411,22 @@ int runPcmCaptureStream(int card, int dev, unsigned int targetRate, unsigned int
                 ioctl(pcmFd, SNDRV_PCM_IOCTL_START);
                 continue;
             }
-            fprintf(stderr, "ERR readi %s: %s (errno=%d)\n", devPath, strerror(errno), errno);
-            break;
+            failReason = std::string(devPath) + " readi=" + strerror(errno);
+            close(pcmFd);
+            return false;
         }
         if (xfer.result <= 0) continue;
 
         size_t inFrames = static_cast<size_t>(xfer.result);
-        if (actualRate == targetRate || actualRate == 0) {
+        if (actualRate == targetOutRate || actualRate == 0) {
             ssize_t written = write(STDOUT_FILENO, inBuf.data(), inFrames * frameBytes);
             if (written <= 0) break;
         } else {
-            // Resampling linear cepat jika hardware mengunci rate di 40000 Hz -> 48000 Hz
-            size_t outFrames = (inFrames * targetRate) / actualRate;
+            size_t outFrames = (inFrames * targetOutRate) / actualRate;
             if (outFrames == 0) continue;
             outBuf.resize(outFrames * channels);
             for (size_t i = 0; i < outFrames; ++i) {
-                double srcPos = (static_cast<double>(i) * actualRate) / targetRate;
+                double srcPos = (static_cast<double>(i) * actualRate) / targetOutRate;
                 size_t idx0 = static_cast<size_t>(srcPos);
                 if (idx0 >= inFrames) idx0 = inFrames - 1;
                 size_t idx1 = (idx0 + 1 < inFrames) ? (idx0 + 1) : idx0;
@@ -372,7 +442,36 @@ int runPcmCaptureStream(int card, int dev, unsigned int targetRate, unsigned int
         }
     }
     close(pcmFd);
-    return 0;
+    return true;
+}
+
+int runPcmCaptureStream(int card, int dev, unsigned int targetRate, unsigned int channels) {
+    struct Candidate { int card; int dev; unsigned int rate; bool asrc; };
+    std::vector<Candidate> candidates;
+    if (card == 0 && dev == 14) {
+        // Urutan prioritas Exynos 850 ABOX: Calliope FE (VPCMIN_DAI4/7) -> WDMA2 48k -> WDMA2 40k native
+        candidates = {
+            {0, 114, targetRate, true},
+            {0, 117, targetRate, true},
+            {0, 14, targetRate, true},
+            {0, 14, 40000, false},
+            {0, 19, targetRate, true}
+        };
+    } else {
+        candidates = { {card, dev, targetRate, true}, {card, dev, 40000, false} };
+    }
+
+    std::string summary;
+    for (const auto& c : candidates) {
+        std::string reason;
+        if (tryStreamSingleDevice(c.card, c.dev, c.rate, targetRate, channels, c.asrc, reason)) {
+            return 0;
+        }
+        if (!summary.empty()) summary += "; ";
+        summary += reason;
+    }
+    fprintf(stderr, "ERR [%s]\n", summary.c_str());
+    return 2;
 }
 #endif
 } // namespace
@@ -528,7 +627,7 @@ int main(int argc, char** argv) {
             }
         } else if (cmd == "ENABLE_FM_ALSA") {
 #if HAS_ALSA_UAPI
-            std::cout << enableFmAlsaRoute() << std::endl;
+            std::cout << enableFmAlsaRoute(true) << std::endl;
 #else
             std::cout << "ERR no_asound_h" << std::endl;
 #endif
@@ -545,6 +644,8 @@ int main(int argc, char** argv) {
 #else
             std::cout << "ERR no_asound_h" << std::endl;
 #endif
+        } else if (cmd == "LIST_V4L2_CTLS") {
+            listV4l2Controls(gFd);
         } else if (cmd == "SET_CTL") {
             std::string rest;
             std::getline(iss >> std::ws, rest);
