@@ -1,10 +1,8 @@
 package id.exynos850.fmradio.ui
 
-import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.content.pm.PackageManager
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -30,7 +28,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import id.exynos850.fmradio.audio.FmAudioTrackEngine
 import id.exynos850.fmradio.data.FmStationDbHelper
@@ -92,13 +89,8 @@ class MainActivity : ComponentActivity() {
 
         val triggerBugReport: () -> Unit = {
             lifecycleScope.launch {
-                val hasCapture = ContextCompat.checkSelfPermission(
-                    this@MainActivity,
-                    Manifest.permission.CAPTURE_AUDIO_OUTPUT
-                ) == PackageManager.PERMISSION_GRANTED
                 val (ok, msg) = fmTuner.generateAndSaveBugReport(
                     packageName = packageName,
-                    hasCapturePermission = hasCapture,
                     nativeDiag = fmTuner.getDiagnosticReport(),
                     extraStatus = tunerError
                 )
@@ -127,14 +119,6 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        val permissionLauncher = rememberLauncherForActivityResult(
-            ActivityResultContracts.RequestPermission()
-        ) { granted ->
-            if (!granted) {
-                Toast.makeText(this, "Izin mikrofon diperlukan untuk AudioTrack FM", Toast.LENGTH_SHORT).show()
-            }
-        }
-
         DisposableEffect(Unit) {
             val callback = audioEngine.registerAntennaCallback { connected ->
                 hasHeadset = connected
@@ -148,19 +132,16 @@ class MainActivity : ComponentActivity() {
             if (isPlaying) {
                 tunerError = null
                 diagnosticReport = null
-                if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO)
-                    != PackageManager.PERMISSION_GRANTED
-                ) {
-                    permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                }
                 if (fmTuner.open(allowRootFallback = true)) {
                     isRootActive = fmTuner.isUsingRootMode()
                     fmTuner.tuneManual(freqKhz)
+                    val alsaRouteStatus = fmTuner.enableFmAudioRoute()
                     val rootFmPcm = fmTuner.detectRootFmPcm()
                     audioEngine.startAudioStream(
                         scope = lifecycleScope,
                         rootFmPcm = rootFmPcm,
-                        rootDaemonPath = fmTuner.getRootDaemonBinaryPath()
+                        rootDaemonPath = fmTuner.getRootDaemonBinaryPath(),
+                        alsaRouteStatus = alsaRouteStatus
                     ) { err ->
                         tunerError = err
                     }
@@ -177,6 +158,7 @@ class MainActivity : ComponentActivity() {
             } else {
                 isRootActive = false
                 audioEngine.stopAudioStream()
+                fmTuner.disableFmAudioRoute()
                 fmTuner.close()
             }
         }
@@ -298,26 +280,10 @@ class MainActivity : ComponentActivity() {
                                     Text("Coba Root (KSU)", maxLines = 1, softWrap = false, fontSize = 12.sp)
                                 }
                             } else {
-                                val hasCapture = ContextCompat.checkSelfPermission(
-                                    this@MainActivity,
-                                    Manifest.permission.CAPTURE_AUDIO_OUTPUT
-                                ) == PackageManager.PERMISSION_GRANTED
-                                Button(
-                                    onClick = {
-                                        lifecycleScope.launch {
-                                            val (_, msg) = fmTuner.installKsuPrivAppModule(applicationInfo.sourceDir)
-                                            diagnosticReport = msg
-                                        }
-                                    },
-                                    shape = RoundedCornerShape(18.dp),
-                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
-                                ) {
-                                    Text("Pasang Priv-App (KSU)", maxLines = 1, softWrap = false, fontSize = 12.sp)
-                                }
                                 FilledTonalButton(
                                     onClick = {
                                         lifecycleScope.launch {
-                                            diagnosticReport = fmTuner.getRootAudioDiagnostic(packageName, hasCapture)
+                                            diagnosticReport = fmTuner.getRootAudioDiagnostic(packageName)
                                         }
                                     },
                                     shape = RoundedCornerShape(18.dp),

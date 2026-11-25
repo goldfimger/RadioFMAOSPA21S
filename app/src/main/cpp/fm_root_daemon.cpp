@@ -13,6 +13,7 @@
 #else
 #define HAS_ALSA_UAPI 0
 #endif
+#include <cstdint>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -41,6 +42,25 @@ int v4l2ToKhz(uint32_t raw) {
 std::string toLowerStr(std::string s) {
     for (char& ch : s) ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
     return s;
+}
+
+void ensureRadioUnmutedAndVolume(int fd) {
+    if (fd < 0) return;
+    struct v4l2_control muteCtrl {};
+    muteCtrl.id = V4L2_CID_AUDIO_MUTE;
+    muteCtrl.value = 0;
+    ioctl(fd, VIDIOC_S_CTRL, &muteCtrl);
+
+    struct v4l2_queryctrl qctrl {};
+    qctrl.id = V4L2_CID_AUDIO_VOLUME;
+    int maxVol = 15;
+    if (ioctl(fd, VIDIOC_QUERYCTRL, &qctrl) == 0 && qctrl.maximum > qctrl.minimum) {
+        maxVol = qctrl.maximum;
+    }
+    struct v4l2_control volCtrl {};
+    volCtrl.id = V4L2_CID_AUDIO_VOLUME;
+    volCtrl.value = maxVol;
+    ioctl(fd, VIDIOC_S_CTRL, &volCtrl);
 }
 
 #if HAS_ALSA_UAPI
@@ -74,7 +94,8 @@ void listFmAlsaControls() {
             lower.find("sifm") == std::string::npos &&
             lower.find("nsrc") == std::string::npos &&
             lower.find("sifs") == std::string::npos &&
-            lower.find("spusm") == std::string::npos) {
+            lower.find("spum") == std::string::npos &&
+            lower.find("wdma2") == std::string::npos) {
             continue;
         }
         struct snd_ctl_elem_info info {};
@@ -97,7 +118,7 @@ void listFmAlsaControls() {
             }
             out += " [";
             unsigned int items = info.value.enumerated.items;
-            if (items > 12) items = 12;
+            if (items > 32) items = 32;
             for (unsigned int k = 0; k < items; ++k) {
                 enumInfo.value.enumerated.item = k;
                 if (ioctl(ctlFd, SNDRV_CTL_IOCTL_ELEM_INFO, &enumInfo) == 0) {
@@ -172,15 +193,46 @@ bool setAlsaControl(const std::string& ctlName, const std::string& ctlVal) {
     return ok;
 }
 
-int runPcmCaptureStream(int card, int dev, unsigned int rate, unsigned int channels) {
-    char devPath[64];
-    snprintf(devPath, sizeof(devPath), "/dev/snd/pcmC%dD%dc", card, dev);
-    int pcmFd = open(devPath, O_RDWR);
-    if (pcmFd < 0) {
-        fprintf(stderr, "ERR open %s: %s\n", devPath, strerror(errno));
-        return 1;
-    }
+std::string enableFmAlsaRoute() {
+    // Sesuai /vendor/etc/mixer_paths.xml Exynos 850:
+    // <path name="route-fm"> -> ABOX NSRC2=SPDY, ABOX SIFM2=WDMA, ABOX SPDY Rate=40000
+    // Ditambah ABOX SPUM ASRC2=1 untuk sinkronisasi 40kHz SPDY -> 48kHz WDMA2.
+    bool sw = setAlsaControl("ABOX SPDY CAP SPDY Switch", "1");
+    setAlsaControl("ABOX SPDY Rate", "40000");
+    setAlsaControl("ABOX SPDY Width", "16");
+    setAlsaControl("ABOX SPDY Channel", "2");
+    bool nsrc = setAlsaControl("ABOX NSRC2", "SPDY");
+    bool sifm = setAlsaControl("ABOX SIFM2", "WDMA");
+    setAlsaControl("ABOX SIFM2 Rate", "48000");
+    setAlsaControl("ABOX SIFM2 Width", "16");
+    bool asrc = setAlsaControl("ABOX SPUM ASRC2", "1");
+    setAlsaControl("ABOX WDMA2 Width", "16");
+    setAlsaControl("ABOX WDMA2 Channel", "2");
+    setAlsaControl("ABOX WDMA2 Rate", "48000");
+    setAlsaControl("ABOX WDMA2 Period", "240");
 
+    std::ostringstream oss;
+    oss << (nsrc ? "OK " : "ERR ")
+        << "NSRC2=SPDY(" << (nsrc ? 1 : 0) << ") "
+        << "SIFM2=WDMA(" << (sifm ? 1 : 0) << ") "
+        << "SPDY_SW(" << (sw ? 1 : 0) << ") "
+        << "ASRC2(" << (asrc ? 1 : 0) << ")";
+    return oss.str();
+}
+
+void disableFmAlsaRoute() {
+    setAlsaControl("ABOX NSRC2", "RESERVED");
+    setAlsaControl("ABOX SPUM ASRC2", "0");
+}
+
+bool configureHwParams(
+    int pcmFd,
+    unsigned int reqRate,
+    unsigned int channels,
+    unsigned int& outRate,
+    unsigned int& outPeriodFrames,
+    unsigned int& outBufferFrames
+) {
     struct snd_pcm_hw_params params {};
     params.rmask = ~0U;
     for (size_t i = 0; i <= SNDRV_PCM_HW_PARAM_LAST_MASK - SNDRV_PCM_HW_PARAM_FIRST_MASK; ++i) {
@@ -208,40 +260,116 @@ int runPcmCaptureStream(int card, int dev, unsigned int rate, unsigned int chann
     setMask(SNDRV_PCM_HW_PARAM_FORMAT, SNDRV_PCM_FORMAT_S16_LE);
     setMask(SNDRV_PCM_HW_PARAM_SUBFORMAT, SNDRV_PCM_SUBFORMAT_STD);
     setInterval(SNDRV_PCM_HW_PARAM_CHANNELS, channels, channels);
-    setInterval(SNDRV_PCM_HW_PARAM_RATE, rate, rate);
-    setInterval(SNDRV_PCM_HW_PARAM_PERIOD_SIZE, 1024, 1024);
-    setInterval(SNDRV_PCM_HW_PARAM_PERIODS, 4, 4);
+    if (reqRate > 0) {
+        setInterval(SNDRV_PCM_HW_PARAM_RATE, reqRate, reqRate);
+    } else {
+        setInterval(SNDRV_PCM_HW_PARAM_RATE, 8000, 96000);
+    }
+    setInterval(SNDRV_PCM_HW_PARAM_PERIOD_SIZE, 240, 4096);
+    setInterval(SNDRV_PCM_HW_PARAM_PERIODS, 2, 16);
 
     if (ioctl(pcmFd, SNDRV_PCM_IOCTL_HW_PARAMS, &params) < 0) {
-        fprintf(stderr, "ERR hw_params %s: %s\n", devPath, strerror(errno));
-        close(pcmFd);
-        return 2;
+        return false;
     }
+
+    outRate = params.intervals[SNDRV_PCM_HW_PARAM_RATE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min;
+    outPeriodFrames = params.intervals[SNDRV_PCM_HW_PARAM_PERIOD_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min;
+    outBufferFrames = params.intervals[SNDRV_PCM_HW_PARAM_BUFFER_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min;
+    if (outPeriodFrames < 64 || outPeriodFrames > 8192) outPeriodFrames = 960;
+    if (outBufferFrames < outPeriodFrames * 2) outBufferFrames = outPeriodFrames * 4;
+    if (outRate == 0) outRate = reqRate > 0 ? reqRate : 48000;
+    return true;
+}
+
+int runPcmCaptureStream(int card, int dev, unsigned int targetRate, unsigned int channels) {
+    // Pastikan route ALSA Exynos ABOX aktif sebelum membuka WDMA2
+    enableFmAlsaRoute();
+
+    char devPath[64];
+    snprintf(devPath, sizeof(devPath), "/dev/snd/pcmC%dD%dc", card, dev);
+    int pcmFd = open(devPath, O_RDWR);
+    if (pcmFd < 0) {
+        pcmFd = open(devPath, O_RDONLY);
+    }
+    if (pcmFd < 0) {
+        fprintf(stderr, "ERR open %s: %s (errno=%d)\n", devPath, strerror(errno), errno);
+        return 1;
+    }
+
+    unsigned int actualRate = targetRate;
+    unsigned int periodFrames = 960;
+    unsigned int bufferFrames = 3840;
+
+    if (!configureHwParams(pcmFd, targetRate, channels, actualRate, periodFrames, bufferFrames)) {
+        int err1 = errno;
+        if (!configureHwParams(pcmFd, 40000, channels, actualRate, periodFrames, bufferFrames) &&
+            !configureHwParams(pcmFd, 0, channels, actualRate, periodFrames, bufferFrames)) {
+            fprintf(stderr, "ERR hw_params %s (rate=%u): %s (errno=%d)\n", devPath, targetRate, strerror(err1), err1);
+            close(pcmFd);
+            return 2;
+        }
+    }
+
+    struct snd_pcm_sw_params sw {};
+    sw.tstamp_mode = SNDRV_PCM_TSTAMP_NONE;
+    sw.period_step = 1;
+    sw.avail_min = periodFrames;
+    sw.start_threshold = 1;
+    sw.stop_threshold = bufferFrames;
+    sw.silence_threshold = 0;
+    sw.silence_size = 0;
+    ioctl(pcmFd, SNDRV_PCM_IOCTL_SW_PARAMS, &sw);
+
     if (ioctl(pcmFd, SNDRV_PCM_IOCTL_PREPARE) < 0) {
-        fprintf(stderr, "ERR prepare %s: %s\n", devPath, strerror(errno));
+        fprintf(stderr, "ERR prepare %s: %s (errno=%d)\n", devPath, strerror(errno), errno);
         close(pcmFd);
         return 3;
     }
+    ioctl(pcmFd, SNDRV_PCM_IOCTL_START);
 
-    unsigned int framesPerRead = 1024;
     size_t frameBytes = static_cast<size_t>(channels) * 2;
-    std::vector<char> buf(framesPerRead * frameBytes);
+    std::vector<int16_t> inBuf(periodFrames * channels);
+    std::vector<int16_t> outBuf;
 
     while (true) {
         struct snd_xferi xfer {};
-        xfer.buf = buf.data();
-        xfer.frames = framesPerRead;
+        xfer.buf = inBuf.data();
+        xfer.frames = periodFrames;
         if (ioctl(pcmFd, SNDRV_PCM_IOCTL_READI_FRAMES, &xfer) < 0) {
             if (errno == EPIPE || errno == ESTRPIPE) {
                 ioctl(pcmFd, SNDRV_PCM_IOCTL_PREPARE);
+                ioctl(pcmFd, SNDRV_PCM_IOCTL_START);
                 continue;
             }
+            fprintf(stderr, "ERR readi %s: %s (errno=%d)\n", devPath, strerror(errno), errno);
             break;
         }
         if (xfer.result <= 0) continue;
-        size_t bytes = static_cast<size_t>(xfer.result) * frameBytes;
-        ssize_t written = write(STDOUT_FILENO, buf.data(), bytes);
-        if (written <= 0) break;
+
+        size_t inFrames = static_cast<size_t>(xfer.result);
+        if (actualRate == targetRate || actualRate == 0) {
+            ssize_t written = write(STDOUT_FILENO, inBuf.data(), inFrames * frameBytes);
+            if (written <= 0) break;
+        } else {
+            // Resampling linear cepat jika hardware mengunci rate di 40000 Hz -> 48000 Hz
+            size_t outFrames = (inFrames * targetRate) / actualRate;
+            if (outFrames == 0) continue;
+            outBuf.resize(outFrames * channels);
+            for (size_t i = 0; i < outFrames; ++i) {
+                double srcPos = (static_cast<double>(i) * actualRate) / targetRate;
+                size_t idx0 = static_cast<size_t>(srcPos);
+                if (idx0 >= inFrames) idx0 = inFrames - 1;
+                size_t idx1 = (idx0 + 1 < inFrames) ? (idx0 + 1) : idx0;
+                double frac = srcPos - static_cast<double>(idx0);
+                for (unsigned int ch = 0; ch < channels; ++ch) {
+                    double s0 = static_cast<double>(inBuf[idx0 * channels + ch]);
+                    double s1 = static_cast<double>(inBuf[idx1 * channels + ch]);
+                    outBuf[i * channels + ch] = static_cast<int16_t>(s0 + (s1 - s0) * frac);
+                }
+            }
+            ssize_t written = write(STDOUT_FILENO, outBuf.data(), outFrames * frameBytes);
+            if (written <= 0) break;
+        }
     }
     close(pcmFd);
     return 0;
@@ -274,6 +402,7 @@ int main(int argc, char** argv) {
 
         if (cmd == "OPEN") {
             if (gFd >= 0) {
+                ensureRadioUnmutedAndVolume(gFd);
                 std::cout << "OK already_open" << std::endl;
                 continue;
             }
@@ -295,10 +424,7 @@ int main(int argc, char** argv) {
                             tuner.audmode = V4L2_TUNER_MODE_STEREO;
                             ioctl(gFd, VIDIOC_S_TUNER, &tuner);
                         }
-                        struct v4l2_control muteCtrl {};
-                        muteCtrl.id = V4L2_CID_AUDIO_MUTE;
-                        muteCtrl.value = 0;
-                        ioctl(gFd, VIDIOC_S_CTRL, &muteCtrl);
+                        ensureRadioUnmutedAndVolume(gFd);
                         break;
                     }
                     lastErr = errno;
@@ -322,6 +448,7 @@ int main(int argc, char** argv) {
             freq.type = V4L2_TUNER_RADIO;
             freq.frequency = khzToV4l2(khz);
             if (ioctl(gFd, VIDIOC_S_FREQUENCY, &freq) == 0) {
+                ensureRadioUnmutedAndVolume(gFd);
                 std::cout << "OK" << std::endl;
             } else {
                 std::cout << "ERR " << errno << " " << strerror(errno) << std::endl;
@@ -372,28 +499,46 @@ int main(int argc, char** argv) {
                 continue;
             }
             char buf[512];
-            int foundCard = -1;
-            int foundDev = -1;
+            int wdmaCard = -1, wdmaDev = -1;
+            int fmCard0 = -1, fmDev0 = -1;
             while (fgets(buf, sizeof(buf), fp)) {
                 std::string lower = toLowerStr(buf);
-                if (lower.find("capture") != std::string::npos &&
-                    (lower.find("fm") != std::string::npos ||
-                     lower.find("radio") != std::string::npos ||
-                     lower.find("spdy") != std::string::npos)) {
-                    int c = -1, d = -1;
-                    if (sscanf(buf, "%d-%d:", &c, &d) == 2) {
-                        foundCard = c;
-                        foundDev = d;
-                        break;
-                    }
+                if (lower.find("capture") == std::string::npos) continue;
+                int c = -1, d = -1;
+                if (sscanf(buf, "%d-%d:", &c, &d) != 2) continue;
+                // Hanya gunakan Card 0 (Exynos3830-Madera), JANGAN Card 2 (abox_dump)
+                if (c != 0) continue;
+                if (lower.find("wdma2") != std::string::npos && lower.find("dual") == std::string::npos) {
+                    wdmaCard = c;
+                    wdmaDev = d;
+                    break;
+                }
+                if (fmCard0 < 0 && (lower.find("fm") != std::string::npos || lower.find("spdy") != std::string::npos)) {
+                    fmCard0 = c;
+                    fmDev0 = d;
                 }
             }
             fclose(fp);
-            if (foundCard >= 0) {
-                std::cout << "OK " << foundCard << " " << foundDev << std::endl;
+            if (wdmaCard >= 0) {
+                std::cout << "OK " << wdmaCard << " " << wdmaDev << std::endl;
+            } else if (fmCard0 >= 0) {
+                std::cout << "OK " << fmCard0 << " " << fmDev0 << std::endl;
             } else {
                 std::cout << "NONE" << std::endl;
             }
+        } else if (cmd == "ENABLE_FM_ALSA") {
+#if HAS_ALSA_UAPI
+            std::cout << enableFmAlsaRoute() << std::endl;
+#else
+            std::cout << "ERR no_asound_h" << std::endl;
+#endif
+        } else if (cmd == "DISABLE_FM_ALSA") {
+#if HAS_ALSA_UAPI
+            disableFmAlsaRoute();
+            std::cout << "OK" << std::endl;
+#else
+            std::cout << "OK" << std::endl;
+#endif
         } else if (cmd == "LIST_FM_CTLS") {
 #if HAS_ALSA_UAPI
             listFmAlsaControls();
@@ -416,6 +561,9 @@ int main(int argc, char** argv) {
             std::cout << "ERR no_asound_h" << std::endl;
 #endif
         } else if (cmd == "CLOSE") {
+#if HAS_ALSA_UAPI
+            disableFmAlsaRoute();
+#endif
             if (gFd >= 0) {
                 close(gFd);
                 gFd = -1;

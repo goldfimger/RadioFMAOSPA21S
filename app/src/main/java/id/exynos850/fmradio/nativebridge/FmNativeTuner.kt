@@ -111,6 +111,7 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
         if (!isOpen) return
         if (usingRootDaemon) {
             rootCommand("MUTE 1")
+            rootCommand("DISABLE_FM_ALSA")
             closeRootDaemon()
         } else {
             nativeSetMute(true)
@@ -171,6 +172,17 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
 
     fun getRootDaemonBinaryPath(): String = File(nativeLibDir, "liba21s_fm_rootd.so").absolutePath
 
+    fun enableFmAudioRoute(): String {
+        if (!usingRootDaemon) return "ERR daemon_not_active"
+        return rootCommand("ENABLE_FM_ALSA")
+    }
+
+    fun disableFmAudioRoute() {
+        if (usingRootDaemon) {
+            rootCommand("DISABLE_FM_ALSA")
+        }
+    }
+
     fun detectRootFmPcm(): Pair<Int, Int>? {
         if (!usingRootDaemon) return null
         val parts = rootCommand("DETECT_FM_PCM").split(" ")
@@ -183,31 +195,23 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
     }
 
     suspend fun getRootAudioDiagnostic(
-        packageName: String,
-        hasCapturePermission: Boolean
+        packageName: String
     ): String = withContext(Dispatchers.IO) {
         val alsaCtls = if (usingRootDaemon) rootCommand("LIST_FM_CTLS") else "Daemon root belum aktif"
+        val pcmDetect = if (usingRootDaemon) rootCommand("DETECT_FM_PCM") else "-"
         runCatching {
             val script = """
-                echo "CAPTURE_AUDIO_OUTPUT: ${if (hasCapturePermission) "GRANTED" else "DENIED"}"
-                dumpsys package $packageName 2>/dev/null | grep -E "codePath=|pkgFlags=|CAPTURE_AUDIO_OUTPUT|ACCESS_FM_RADIO" | head -n 12 || true
-                echo "=== KSU Module ==="
-                ls -la /data/adb/modules/a21s_fm_privapp/system/priv-app/A21sFMRadio /data/adb/modules/a21s_fm_privapp/system/etc/permissions 2>&1 || true
-                echo "=== audio_policy FM check ==="
-                grep -inE "fm|radio|tuner" /vendor/etc/*audio_policy* /vendor/etc/audio/*audio_policy* /system/etc/*audio_policy* 2>/dev/null | head -n 20 || echo "NO_FM_IN_AUDIO_POLICY"
-                echo "=== capture PCM (/proc/asound/pcm) ==="
-                grep -i "capture" /proc/asound/pcm 2>&1 || true
-                echo "=== mixer_paths.xml (Speedy/FM lines 1-110) ==="
-                sed -n '1,110p' /vendor/etc/mixer_paths.xml 2>/dev/null | grep -iE -C 2 "speedy|spdy|fm|sifm|nsrc" | head -n 45 || true
-                echo "=== mixer_paths.xml <path> FM ==="
-                grep -inE "<path.*(fm|radio|spdy)" /vendor/etc/mixer_paths.xml 2>/dev/null || echo "NO_FM_PATH_TAG"
+                echo "=== capture PCM Card 0 (/proc/asound/pcm) ==="
+                grep -iE "^00-.*capture" /proc/asound/pcm 2>&1 || true
+                echo "=== Dumpsys Package ==="
+                dumpsys package $packageName 2>/dev/null | grep -E "codePath=|pkgFlags=|ACCESS_FM_RADIO" | head -n 8 || true
             """.trimIndent()
             val proc = ProcessBuilder("su", "-c", script)
                 .redirectErrorStream(true)
                 .start()
             val out = proc.inputStream.bufferedReader().readText().trim()
             proc.waitFor()
-            val combined = "$out\n=== ALSA FM/SPDY Controls ===\n$alsaCtls"
+            val combined = "$out\n=== DETECT_FM_PCM ===\n$pcmDetect\n=== ALSA FM/SPDY/WDMA2 Controls ===\n$alsaCtls"
             combined.trim().ifBlank { "Tidak ada output diagnostik root." }
         }.getOrElse { ex ->
             "Gagal membaca diagnostik root: ${ex.message}"
@@ -216,7 +220,6 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
 
     suspend fun generateAndSaveBugReport(
         packageName: String,
-        hasCapturePermission: Boolean,
         nativeDiag: String,
         extraStatus: String?
     ): Pair<Boolean, String> = withContext(Dispatchers.IO) {
@@ -234,6 +237,7 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
                 p.inputStream.bufferedReader().readText().trim()
             }.getOrDefault("Daemon root belum berjalan")
         }
+        val pcmDetect = if (usingRootDaemon) rootCommand("DETECT_FM_PCM") else "Daemon root belum berjalan"
 
         val collected = runCatching {
             val script = """
@@ -241,37 +245,20 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
                 date
                 echo "Model: $(getprop ro.product.model) ($(getprop ro.product.device))"
                 echo "Android: $(getprop ro.build.version.release) | SDK: $(getprop ro.build.version.sdk)"
-                echo "Lineage: $(getprop ro.lineage.version)"
                 echo "Kernel: $(uname -a)"
-                echo "CAPTURE_AUDIO_OUTPUT: ${if (hasCapturePermission) "GRANTED" else "DENIED"}"
                 echo ""
                 echo "=== PACKAGE DUMPSYS ==="
-                dumpsys package $packageName 2>/dev/null | grep -E "codePath=|pkgFlags=|privateFlags=|CAPTURE_AUDIO_OUTPUT|ACCESS_FM_RADIO|RECORD_AUDIO" || true
-                echo ""
-                echo "=== KSU MODULE (/data/adb/modules/a21s_fm_privapp) ==="
-                ls -laR /data/adb/modules/a21s_fm_privapp 2>&1 || true
+                dumpsys package $packageName 2>/dev/null | grep -E "codePath=|pkgFlags=|ACCESS_FM_RADIO" || true
                 echo ""
                 echo "=== DEV & SYSFS RADIO ==="
                 ls -lZ /dev/radio* /dev/fm* /sys/class/video4linux/radio* 2>&1 || true
                 echo ""
-                echo "=== /proc/asound/cards & pcm ==="
+                echo "=== /proc/asound/cards & pcm (Card 0) ==="
                 cat /proc/asound/cards 2>&1 || true
-                cat /proc/asound/pcm 2>&1 || true
-                echo ""
-                echo "=== AUDIO POLICY FILES ==="
-                find /vendor/etc /system/etc -iname "*audio_policy*" 2>/dev/null || true
-                echo "--- grep fm|radio|tuner ---"
-                grep -inE "fm|radio|tuner" /vendor/etc/*audio_policy* /vendor/etc/audio/*audio_policy* /system/etc/*audio_policy* 2>/dev/null || echo "NO_FM_IN_AUDIO_POLICY"
-                echo "--- /vendor/etc/audio_policy_configuration.xml ---"
-                cat /vendor/etc/audio_policy_configuration.xml 2>/dev/null || cat /vendor/etc/audio/audio_policy_configuration.xml 2>/dev/null || true
-                echo ""
-                echo "=== /vendor/etc/mixer_paths.xml (1-180) ==="
-                nl -ba /vendor/etc/mixer_paths.xml 2>/dev/null | sed -n '1,180p' || true
-                echo "--- mixer_paths.xml FM/SPDY/SIFM/WDMA refs ---"
-                grep -inE -C 3 "speedy|spdy|fm|radio|sifm" /vendor/etc/mixer_paths.xml 2>/dev/null | head -n 120 || true
+                grep -E "^00-" /proc/asound/pcm 2>&1 || true
                 echo ""
                 echo "=== LOGCAT (Audio/FM) ==="
-                logcat -d -t 120 2>/dev/null | grep -iE "A21sFm|AudioRecord|AudioTrack|AudioFlinger|AudioPolicy|audio_hw|audio_route|APM|fm_" | tail -n 80 || true
+                logcat -d -t 120 2>/dev/null | grep -iE "A21sFm|AudioTrack|AudioFlinger|audio_hw|fm_" | tail -n 60 || true
             """.trimIndent()
             val proc = ProcessBuilder("su", "-c", script)
                 .redirectErrorStream(true)
@@ -286,6 +273,7 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
         val fullReport = buildString {
             appendLine("=== STATUS APLIKASI ===")
             appendLine("Error/Status: ${extraStatus ?: "-"}")
+            appendLine("DETECT_FM_PCM: $pcmDetect")
             appendLine()
             appendLine("=== NATIVE DIAGNOSTIC ===")
             appendLine(nativeDiag.ifBlank { "-" })
@@ -321,70 +309,7 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
         if (savedDirect) {
             true to "Bug report berhasil disimpan ke:\n$targetPath"
         } else {
-            false to "Gagal menulis ke $targetPath (aktifkan izin root di KSU atau izin penyimpanan)."
-        }
-    }
-
-    suspend fun installKsuPrivAppModule(apkSourcePath: String): Pair<Boolean, String> = withContext(Dispatchers.IO) {
-        if (apkSourcePath.isBlank()) {
-            return@withContext false to "Path APK tidak ditemukan."
-        }
-        runCatching {
-            val modDir = "/data/adb/modules/a21s_fm_privapp"
-            val privAppDir = "$modDir/system/priv-app/A21sFMRadio"
-            val permDir = "$modDir/system/etc/permissions"
-            val script = """
-                mkdir -p "$privAppDir/lib/arm64" "$permDir"
-                cp -f "$apkSourcePath" "$privAppDir/A21sFMRadio.apk"
-                chmod 0644 "$privAppDir/A21sFMRadio.apk"
-                if [ -d "$nativeLibDir" ]; then
-                  cp -f "$nativeLibDir"/*.so "$privAppDir/lib/arm64/" 2>/dev/null || true
-                  chmod 0755 "$privAppDir/lib/arm64"/*.so 2>/dev/null || true
-                fi
-                cat << 'EOF' > "$modDir/module.prop"
-id=a21s_fm_privapp
-name=A21s FM Radio Priv-App
-version=v1.1
-versionCode=2
-author=exynos850
-description=Memberikan izin system priv-app CAPTURE_AUDIO_OUTPUT dan ACCESS_FM_RADIO untuk A21s FM Radio di LineageOS 22.2
-EOF
-                cat << 'EOF' > "$permDir/privapp-permissions-id.exynos850.fmradio.xml"
-<?xml version="1.0" encoding="utf-8"?>
-<permissions>
-    <privapp-permissions package="id.exynos850.fmradio">
-        <permission name="android.permission.ACCESS_FM_RADIO" />
-        <permission name="android.permission.CAPTURE_AUDIO_OUTPUT" />
-        <permission name="android.permission.MODIFY_AUDIO_SETTINGS" />
-    </privapp-permissions>
-</permissions>
-EOF
-                chmod 0644 "$modDir/module.prop" "$permDir/privapp-permissions-id.exynos850.fmradio.xml"
-                if grep -qiE "AUDIO_DEVICE_IN_FM_TUNER|FM Tuner" /vendor/etc/*audio_policy* /vendor/etc/audio/*audio_policy* 2>/dev/null; then
-                  echo "POLICY_HAS_FM=1"
-                else
-                  echo "POLICY_HAS_FM=0"
-                fi
-                echo "MODUL_OK"
-            """.trimIndent()
-            val proc = ProcessBuilder("su", "-c", script)
-                .redirectErrorStream(true)
-                .start()
-            val out = proc.inputStream.bufferedReader().readText().trim()
-            val code = proc.waitFor()
-            val ok = code == 0 && out.contains("MODUL_OK")
-            val hasPolicyFm = out.contains("POLICY_HAS_FM=1")
-            ok to if (ok) {
-                if (hasPolicyFm) {
-                    "Modul KernelSU dibuat di $modDir. Reboot perangkat, lalu pastikan di KernelSU Manager opsi 'Umount modules' tidak aktif untuk aplikasi ini."
-                } else {
-                    "Modul Priv-App dibuat di $modDir, TETAPI audio_policy LineageOS A21s tidak memiliki AUDIO_DEVICE_IN_FM_TUNER. Tekan 'Cek Audio HAL' lalu 'Salin Log' untuk pemetaan jalur ALSA ABOX."
-                }
-            } else {
-                "Gagal membuat modul Priv-App: $out"
-            }
-        }.getOrElse { ex ->
-            false to "Gagal menjalankan su untuk modul Priv-App: ${ex.message}"
+            false to "Gagal menulis ke $targetPath (aktifkan izin root di KSU)."
         }
     }
 

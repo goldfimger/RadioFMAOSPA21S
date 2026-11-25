@@ -1,15 +1,12 @@
 package id.exynos850.fmradio.audio
 
-import android.annotation.SuppressLint
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
-import android.media.AudioRecord
 import android.media.AudioTrack
-import android.media.MediaRecorder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -20,14 +17,11 @@ class FmAudioTrackEngine(private val context: Context) {
 
     companion object {
         private const val SAMPLE_RATE = 48000
-        // AudioSource internal Android untuk FM Tuner (MediaRecorder.AudioSource.RADIO_TUNER = 1998)
-        private const val AUDIO_SOURCE_RADIO_TUNER = 1998
     }
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-    private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
-    private var tinycapProc: Process? = null
+    private var pcmStreamProc: Process? = null
     private var streamJob: Job? = null
     private var currentVolume = 0.85f
     private var isSpeakerForced = false
@@ -59,23 +53,14 @@ class FmAudioTrackEngine(private val context: Context) {
         audioManager.unregisterAudioDeviceCallback(callback)
     }
 
-    @SuppressLint("MissingPermission")
     fun startAudioStream(
         scope: CoroutineScope,
         rootFmPcm: Pair<Int, Int>? = null,
         rootDaemonPath: String = "",
+        alsaRouteStatus: String = "",
         onError: (String) -> Unit
     ) {
         if (streamJob?.isActive == true) return
-
-        val hasCapturePerm = context.checkSelfPermission(android.Manifest.permission.CAPTURE_AUDIO_OUTPUT) ==
-            android.content.pm.PackageManager.PERMISSION_GRANTED
-
-        val minRecordBuf = AudioRecord.getMinBufferSize(
-            SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_STEREO,
-            AudioFormat.ENCODING_PCM_16BIT
-        ).coerceAtLeast(4096)
 
         val minTrackBuf = AudioTrack.getMinBufferSize(
             SAMPLE_RATE,
@@ -83,10 +68,10 @@ class FmAudioTrackEngine(private val context: Context) {
             AudioFormat.ENCODING_PCM_16BIT
         ).coerceAtLeast(4096)
 
-        val bufferSize = maxOf(minRecordBuf, minTrackBuf) * 2
+        val bufferSize = minTrackBuf * 2
 
         try {
-            // AudioTrack berlatensi rendah untuk memutar output PCM FM
+            // AudioTrack berlatensi rendah untuk memutar output PCM FM langsung (tanpa AudioRecord/recording)
             audioTrack = AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
@@ -105,39 +90,6 @@ class FmAudioTrackEngine(private val context: Context) {
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
 
-            audioRecord = runCatching {
-                AudioRecord(
-                    AUDIO_SOURCE_RADIO_TUNER,
-                    SAMPLE_RATE,
-                    AudioFormat.CHANNEL_IN_STEREO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufferSize
-                )
-            }.getOrNull()
-
-            if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
-                applyRouting()
-                runCatching {
-                    audioManager.setParameters("fm_mode=on")
-                    audioManager.setParameters("fm_radio_mute=0")
-                }
-                audioTrack?.setVolume(currentVolume)
-                audioTrack?.play()
-                audioRecord?.startRecording()
-
-                streamJob = scope.launch(Dispatchers.IO) {
-                    val pcmBuffer = ShortArray(2048)
-                    while (isActive) {
-                        val readCount = audioRecord?.read(pcmBuffer, 0, pcmBuffer.size) ?: -1
-                        if (readCount > 0) {
-                            audioTrack?.write(pcmBuffer, 0, readCount, AudioTrack.WRITE_BLOCKING)
-                        }
-                    }
-                }
-                return
-            }
-
-            // Fallback Root ALSA PCM (liba21s_fm_rootd.so pcm -> AudioTrack) tanpa butuh tinycap
             if (rootFmPcm != null && rootDaemonPath.isNotBlank()) {
                 val (card, dev) = rootFmPcm
                 val proc = runCatching {
@@ -148,14 +100,23 @@ class FmAudioTrackEngine(private val context: Context) {
                 }.getOrNull()
 
                 if (proc != null) {
-                    tinycapProc = proc
+                    pcmStreamProc = proc
                     applyRouting()
-                    runCatching { audioManager.setParameters("fm_mode=on") }
                     audioTrack?.setVolume(currentVolume)
                     audioTrack?.play()
 
                     streamJob = scope.launch(Dispatchers.IO) {
-                        val byteBuf = ByteArray(4096)
+                        val errBuf = StringBuilder()
+                        val errReaderJob = launch(Dispatchers.IO) {
+                            runCatching {
+                                proc.errorStream.bufferedReader().useLines { lines ->
+                                    lines.forEach { line ->
+                                        if (errBuf.length < 512) errBuf.appendLine(line)
+                                    }
+                                }
+                            }
+                        }
+                        val byteBuf = ByteArray(3840)
                         val input = proc.inputStream
                         var totalWritten = 0L
                         while (isActive) {
@@ -164,27 +125,19 @@ class FmAudioTrackEngine(private val context: Context) {
                             audioTrack?.write(byteBuf, 0, readBytes, AudioTrack.WRITE_BLOCKING)
                             totalWritten += readBytes
                         }
+                        errReaderJob.join()
                         if (isActive && totalWritten == 0L) {
+                            val stderrText = errBuf.toString().trim().ifBlank { "EOF tanpa data" }
                             releaseAudioHandles()
-                            onError("Node PCM ALSA tidak mengirim data. Tekan 'Cek Audio HAL' lalu 'Salin Log'.")
+                            onError("Stream ALSA pcmC${card}D${dev}c kosong ($stderrText) | Route: $alsaRouteStatus")
                         }
                     }
                     return
                 }
             }
 
-            // Aktifkan routing HAL FM sebagai fallback dan beri diagnosa izin yang spesifik
-            runCatching {
-                audioManager.setParameters("fm_mode=on")
-                audioManager.setParameters("fm_radio_mute=0")
-            }
             releaseAudioHandles()
-            val permNote = if (hasCapturePerm) {
-                "Izin CAPTURE_AUDIO_OUTPUT sudah AKTIF, tetapi audio_policy LineageOS belum mendaftarkan AUDIO_DEVICE_IN_FM_TUNER."
-            } else {
-                "Izin CAPTURE_AUDIO_OUTPUT masih DENIED (APK user di /data/app menimpa priv-app atau modul KSU belum termount)."
-            }
-            onError("Tuner /dev/radio0 aktif! $permNote Tekan 'Cek Audio HAL' lalu 'Salin Log'.")
+            onError("Node capture ALSA WDMA2 (00-14) belum terbuka. Route: $alsaRouteStatus. Tekan 'Cek Audio HAL' atau 'Bug Report (.txt)'.")
         } catch (ex: Exception) {
             releaseAudioHandles()
             onError(ex.message ?: "Gagal memulai AudioTrack stream")
@@ -215,26 +168,17 @@ class FmAudioTrackEngine(private val context: Context) {
     private fun releaseAudioHandles() {
         streamJob?.cancel()
         streamJob = null
-        runCatching { tinycapProc?.destroy() }
-        tinycapProc = null
-        try {
-            audioRecord?.stop()
-            audioRecord?.release()
-        } catch (_: Exception) {}
+        runCatching { pcmStreamProc?.destroy() }
+        pcmStreamProc = null
         try {
             audioTrack?.pause()
             audioTrack?.flush()
             audioTrack?.release()
         } catch (_: Exception) {}
-        audioRecord = null
         audioTrack = null
     }
 
     fun stopAudioStream() {
-        runCatching {
-            audioManager.setParameters("fm_radio_mute=1")
-            audioManager.setParameters("fm_mode=off")
-        }
         releaseAudioHandles()
     }
 }
