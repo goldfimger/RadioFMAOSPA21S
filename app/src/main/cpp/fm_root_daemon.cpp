@@ -14,6 +14,7 @@
 #else
 #define HAS_ALSA_UAPI 0
 #endif
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <sstream>
@@ -65,7 +66,7 @@ void ensureRadioUnmutedAndVolume(int fd) {
 }
 
 #if HAS_ALSA_UAPI
-void listFmAlsaControls() {
+void listFmAlsaControls(bool includeExtended = false) {
     int ctlFd = open("/dev/snd/controlC0", O_RDWR);
     if (ctlFd < 0) {
         std::cout << "ERR open /dev/snd/controlC0: " << strerror(errno) << std::endl;
@@ -90,16 +91,31 @@ void listFmAlsaControls() {
     for (unsigned int i = 0; i < list.used; ++i) {
         std::string name(reinterpret_cast<const char*>(ids[i].name));
         std::string lower = toLowerStr(name);
-        if (lower.find("fm") == std::string::npos &&
-            lower.find("spdy") == std::string::npos &&
-            lower.find("sifm") == std::string::npos &&
-            lower.find("nsrc") == std::string::npos &&
-            lower.find("sifs") == std::string::npos &&
-            lower.find("spum") == std::string::npos &&
-            lower.find("wdma2") == std::string::npos &&
-            lower.find("vpcmin_dai4") == std::string::npos &&
-            lower.find("vpcmin_dai7") == std::string::npos &&
-            lower.find("bd_srccom6") == std::string::npos) {
+        bool matchCore =
+            lower.find("fm") != std::string::npos ||
+            lower.find("spdy") != std::string::npos ||
+            lower.find("sifm") != std::string::npos ||
+            lower.find("nsrc") != std::string::npos ||
+            lower.find("sifs") != std::string::npos ||
+            lower.find("spum") != std::string::npos ||
+            lower.find("wdma2") != std::string::npos ||
+            lower.find("vpcmin_dai4") != std::string::npos ||
+            lower.find("vpcmin_dai7") != std::string::npos ||
+            lower.find("bd_srccom6") != std::string::npos;
+        bool matchExtended = includeExtended && (
+            lower.find("spus") != std::string::npos ||
+            lower.find("vpcm") != std::string::npos ||
+            lower.find("uaif0") != std::string::npos ||
+            lower.find("uaif1") != std::string::npos ||
+            lower.find("dac") != std::string::npos ||
+            lower.find("headphone") != std::string::npos ||
+            lower.find("headset") != std::string::npos ||
+            lower.find("speaker") != std::string::npos ||
+            lower.find("aux") != std::string::npos ||
+            lower.find("clk") != std::string::npos ||
+            lower.find("sound type") != std::string::npos
+        );
+        if (!matchCore && !matchExtended) {
             continue;
         }
         struct snd_ctl_elem_info info {};
@@ -343,9 +359,175 @@ bool configureHwParams(
     return true;
 }
 
+struct DiscoveredCapturePcm {
+    int card;
+    int dev;
+    std::string rawName;
+    std::string lowerName;
+};
+
+struct FmPcmCandidate {
+    int card;
+    int dev;
+    std::string name;
+    unsigned int rate;
+    bool asrc;
+};
+
+std::vector<DiscoveredCapturePcm> discoverCard0CapturePcms() {
+    std::vector<DiscoveredCapturePcm> result;
+    FILE* fp = fopen("/proc/asound/pcm", "r");
+    if (!fp) return result;
+
+    char buf[512];
+    while (fgets(buf, sizeof(buf), fp)) {
+        std::string line(buf);
+        std::string lower = toLowerStr(line);
+        if (lower.find("capture") == std::string::npos) continue;
+        int c = -1, d = -1;
+        if (sscanf(buf, "%d-%d:", &c, &d) != 2) continue;
+        // Hanya Card 0 (Exynos3830-Madera), hindari Card 2 (abox_dump)
+        if (c != 0) continue;
+
+        std::string namePart = "pcm";
+        size_t colon1 = line.find(':');
+        if (colon1 != std::string::npos) {
+            size_t colon2 = line.find(':', colon1 + 1);
+            std::string sub = (colon2 != std::string::npos)
+                ? line.substr(colon1 + 1, colon2 - colon1 - 1)
+                : line.substr(colon1 + 1);
+            size_t first = sub.find_first_not_of(" \t");
+            size_t last = sub.find_last_not_of(" \t\r\n");
+            if (first != std::string::npos && last != std::string::npos && last >= first) {
+                namePart = sub.substr(first, last - first + 1);
+            }
+        }
+        result.push_back({c, d, namePart, toLowerStr(namePart)});
+    }
+    fclose(fp);
+    return result;
+}
+
+std::vector<FmPcmCandidate> buildDynamicFmCandidates(
+    unsigned int targetRate,
+    int preferredCard = -1,
+    int preferredDev = -1
+) {
+    const auto discovered = discoverCard0CapturePcms();
+    std::vector<FmPcmCandidate> candidates;
+
+    auto addUnique = [&](int card, int dev, const std::string& name, unsigned int rate, bool asrc) {
+        for (const auto& existing : candidates) {
+            if (existing.card == card && existing.dev == dev &&
+                existing.rate == rate && existing.asrc == asrc) {
+                return;
+            }
+        }
+        candidates.push_back({card, dev, name, rate, asrc});
+    };
+
+    // 1. Node capture eksplisit bertanda FM / SPDY jika tersedia di kernel
+    for (const auto& p : discovered) {
+        if (p.lowerName.find("fm") != std::string::npos ||
+            p.lowerName.find("spdy") != std::string::npos) {
+            addUnique(p.card, p.dev, p.rawName, targetRate, false);
+            addUnique(p.card, p.dev, p.rawName, 40000, false);
+        }
+    }
+
+    // 2. Calliope VDMA sesuai route-fm (/vendor/etc/mixer_paths.xml: VPCMIN_DAI4 & VPCMIN_DAI7)
+    for (const auto& p : discovered) {
+        if (p.lowerName.find("calliope_14") != std::string::npos) {
+            addUnique(p.card, p.dev, p.rawName, targetRate, false);
+            addUnique(p.card, p.dev, p.rawName, targetRate, true);
+        }
+    }
+    for (const auto& p : discovered) {
+        if (p.lowerName.find("calliope_17") != std::string::npos) {
+            addUnique(p.card, p.dev, p.rawName, targetRate, false);
+        }
+    }
+
+    // 3. Hardware WDMA2 (ABOX SIFM2=WDMA) & WDMA2 DUAL sesuai mixer_paths.xml
+    for (const auto& p : discovered) {
+        if (p.lowerName.find("wdma2") != std::string::npos &&
+            p.lowerName.find("dual") == std::string::npos) {
+            addUnique(p.card, p.dev, p.rawName, targetRate, false);
+            addUnique(p.card, p.dev, p.rawName, 40000, false);
+        }
+    }
+    for (const auto& p : discovered) {
+        if (p.lowerName.find("wdma2") != std::string::npos &&
+            p.lowerName.find("dual") != std::string::npos) {
+            addUnique(p.card, p.dev, p.rawName, targetRate, false);
+        }
+    }
+
+    // 4. Node pilihan dari argumen jika belum tercakup
+    if (preferredCard >= 0 && preferredDev >= 0) {
+        std::string prefName = "pcmC" + std::to_string(preferredCard) + "D" + std::to_string(preferredDev) + "c";
+        for (const auto& p : discovered) {
+            if (p.card == preferredCard && p.dev == preferredDev) {
+                prefName = p.rawName;
+                break;
+            }
+        }
+        addUnique(preferredCard, preferredDev, prefName, targetRate, false);
+        addUnique(preferredCard, preferredDev, prefName, targetRate, true);
+        addUnique(preferredCard, preferredDev, prefName, 40000, false);
+    }
+
+    return candidates;
+}
+
+bool writeConvertedFramesToStdout(
+    const int16_t* inSamples,
+    size_t inFrames,
+    unsigned int actualRate,
+    unsigned int targetOutRate,
+    unsigned int channels,
+    std::vector<int16_t>& outBuf,
+    unsigned long totalFramesOut
+) {
+    size_t frameBytes = static_cast<size_t>(channels) * 2;
+    if (actualRate == targetOutRate || actualRate == 0) {
+        ssize_t written = write(STDOUT_FILENO, inSamples, inFrames * frameBytes);
+        if (written <= 0) {
+            fprintf(stderr, "STDOUT_END frames=%lu errno=%d\n", totalFramesOut, errno);
+            fflush(stderr);
+            return false;
+        }
+        return true;
+    }
+
+    size_t outFrames = (inFrames * targetOutRate) / actualRate;
+    if (outFrames == 0) return true;
+    outBuf.resize(outFrames * channels);
+    for (size_t i = 0; i < outFrames; ++i) {
+        double srcPos = (static_cast<double>(i) * actualRate) / targetOutRate;
+        size_t idx0 = static_cast<size_t>(srcPos);
+        if (idx0 >= inFrames) idx0 = inFrames - 1;
+        size_t idx1 = (idx0 + 1 < inFrames) ? (idx0 + 1) : idx0;
+        double frac = srcPos - static_cast<double>(idx0);
+        for (unsigned int ch = 0; ch < channels; ++ch) {
+            double s0 = static_cast<double>(inSamples[idx0 * channels + ch]);
+            double s1 = static_cast<double>(inSamples[idx1 * channels + ch]);
+            outBuf[i * channels + ch] = static_cast<int16_t>(s0 + (s1 - s0) * frac);
+        }
+    }
+    ssize_t written = write(STDOUT_FILENO, outBuf.data(), outFrames * frameBytes);
+    if (written <= 0) {
+        fprintf(stderr, "STDOUT_END frames=%lu errno=%d\n", totalFramesOut, errno);
+        fflush(stderr);
+        return false;
+    }
+    return true;
+}
+
 bool tryStreamSingleDevice(
     int card,
     int dev,
+    const std::string& devLabel,
     unsigned int reqRate,
     unsigned int targetOutRate,
     unsigned int channels,
@@ -354,21 +536,21 @@ bool tryStreamSingleDevice(
     int pollTimeoutMs,
     std::string& detailMsg
 ) {
-    enableFmAlsaRoute(useAsrc, reqRate > 0 ? reqRate : targetOutRate);
+    std::string routeInfo = enableFmAlsaRoute(useAsrc, reqRate > 0 ? reqRate : targetOutRate);
 
     char devPath[64];
     snprintf(devPath, sizeof(devPath), "/dev/snd/pcmC%dD%dc", card, dev);
     int pcmFd = open(devPath, O_RDWR);
     if (pcmFd < 0) pcmFd = open(devPath, O_RDONLY);
     if (pcmFd < 0) {
-        detailMsg = std::string(devPath) + " open=" + strerror(errno);
+        detailMsg = std::string(devPath) + "(" + devLabel + ") open=" + strerror(errno);
         return false;
     }
 
     unsigned int actualRate = reqRate;
     unsigned int periodFrames = 240;
     unsigned int bufferFrames = 960;
-    // Prefer PrdSz=240 #Prds=2..8 (matching samsung-abox-vdma), then fallback broader range
+    // Prioritaskan PrdSz=240 #Prds=2..8 (sesuai samsung-abox-vdma/wdma2), lalu fallback lebih lebar
     bool hwOk = configureHwParams(pcmFd, reqRate, channels, 240, 240, 2, 8, actualRate, periodFrames, bufferFrames) ||
                 configureHwParams(pcmFd, reqRate, channels, 240, 4096, 2, 16, actualRate, periodFrames, bufferFrames) ||
                 (reqRate != 0 && configureHwParams(pcmFd, 0, channels, 240, 4096, 2, 16, actualRate, periodFrames, bufferFrames));
@@ -407,52 +589,112 @@ bool tryStreamSingleDevice(
         int stOk = ioctl(pcmFd, SNDRV_PCM_IOCTL_STATUS, &st);
         detailMsg = std::string(devPath) + "@" + std::to_string(actualRate) +
                     "(asrc=" + (useAsrc ? "1" : "0") + ") p=" + std::to_string(periodFrames) +
+                    " buf=" + std::to_string(bufferFrames) +
                     (pr == 0 ? " poll_timeout" : " poll_err(" + std::to_string(pfd.revents) + ")") +
                     (stOk == 0 ? " st=" + std::to_string(st.state) : "");
         close(pcmFd);
         return false;
     }
 
-    size_t frameBytes = static_cast<size_t>(channels) * 2;
     std::vector<int16_t> inBuf(periodFrames * channels);
     std::vector<int16_t> outBuf;
+    std::vector<int16_t> stagingSamples;
 
-    if (probeOnly) {
-        unsigned long totalFrames = 0;
-        int peakAbs = 0;
-        unsigned long nonZero = 0;
-        int readsOk = 0;
-        for (int r = 0; r < 3; ++r) {
-            struct snd_xferi xfer {};
-            xfer.buf = inBuf.data();
-            xfer.frames = periodFrames;
-            if (ioctl(pcmFd, SNDRV_PCM_IOCTL_READI_FRAMES, &xfer) < 0) {
+    const int maxValidationReads = probeOnly ? 10 : 15;
+    unsigned long totalValFrames = 0;
+    int peakAbs = 0;
+    unsigned long nonZeroStrong = 0;
+    unsigned long anyNonZero = 0;
+    int readsOk = 0;
+
+    for (int r = 0; r < maxValidationReads; ++r) {
+        if (r > 0) {
+            int prNext = poll(&pfd, 1, 250);
+            if (prNext <= 0 || (pfd.revents & (POLLERR | POLLHUP)) != 0) {
                 detailMsg = std::string(devPath) + "@" + std::to_string(actualRate) +
-                            "(asrc=" + (useAsrc ? "1" : "0") + ") read#" + std::to_string(r) +
-                            "=" + strerror(errno) + " prevFrames=" + std::to_string(totalFrames);
+                            "(asrc=" + (useAsrc ? "1" : "0") + ") val_poll#" + std::to_string(r) +
+                            (prNext == 0 ? "_timeout" : "_err");
                 close(pcmFd);
                 return false;
             }
-            readsOk++;
-            totalFrames += static_cast<unsigned long>(xfer.result);
-            size_t samples = static_cast<size_t>(xfer.result) * channels;
-            for (size_t i = 0; i < samples; ++i) {
-                int s = inBuf[i];
-                int a = (s < 0) ? -s : s;
-                if (a > peakAbs) peakAbs = a;
-                if (a > 2) nonZero++;
+        }
+        struct snd_xferi xfer {};
+        xfer.buf = inBuf.data();
+        xfer.frames = periodFrames;
+        if (ioctl(pcmFd, SNDRV_PCM_IOCTL_READI_FRAMES, &xfer) < 0) {
+            if (errno == EPIPE || errno == ESTRPIPE) {
+                ioctl(pcmFd, SNDRV_PCM_IOCTL_PREPARE);
+                ioctl(pcmFd, SNDRV_PCM_IOCTL_START);
+                continue;
+            }
+            detailMsg = std::string(devPath) + "@" + std::to_string(actualRate) +
+                        "(asrc=" + (useAsrc ? "1" : "0") + ") read#" + std::to_string(r) +
+                        "=" + strerror(errno) + " prevFrames=" + std::to_string(totalValFrames);
+            close(pcmFd);
+            return false;
+        }
+        if (xfer.result <= 0) continue;
+
+        readsOk++;
+        size_t gotFrames = std::min(static_cast<size_t>(xfer.result), static_cast<size_t>(periodFrames));
+        totalValFrames += static_cast<unsigned long>(gotFrames);
+        size_t samples = gotFrames * channels;
+        for (size_t i = 0; i < samples; ++i) {
+            int s = inBuf[i];
+            int a = (s < 0) ? -s : s;
+            if (a > peakAbs) peakAbs = a;
+            if (a > 0) anyNonZero++;
+            if (a > 2) nonZeroStrong++;
+        }
+        if (!probeOnly) {
+            stagingSamples.insert(stagingSamples.end(), inBuf.begin(), inBuf.begin() + samples);
+            if (anyNonZero > 0 && r >= 2) {
+                break; // Audio non-zero terverifikasi, lanjut streaming segera
             }
         }
+    }
+
+    if (anyNonZero == 0 || peakAbs == 0) {
         detailMsg = std::string(devPath) + "@" + std::to_string(actualRate) +
-                    "(asrc=" + (useAsrc ? "1" : "0") + ") OK reads=" + std::to_string(readsOk) +
-                    " frames=" + std::to_string(totalFrames) +
+                    "(asrc=" + (useAsrc ? "1" : "0") + ") silent_zero_pcm(reads=" + std::to_string(readsOk) +
+                    ",frames=" + std::to_string(totalValFrames) +
+                    ",peak=0,nz=0,p=" + std::to_string(periodFrames) +
+                    ",buf=" + std::to_string(bufferFrames) + ")";
+        close(pcmFd);
+        return false;
+    }
+
+    if (probeOnly) {
+        detailMsg = std::string(devPath) + "@" + std::to_string(actualRate) +
+                    "(asrc=" + (useAsrc ? "1" : "0") + ") AUDIO_VALID reads=" + std::to_string(readsOk) +
+                    " frames=" + std::to_string(totalValFrames) +
                     " peak=" + std::to_string(peakAbs) +
-                    " nz=" + std::to_string(nonZero);
+                    " nz=" + std::to_string(nonZeroStrong) +
+                    " p=" + std::to_string(periodFrames) +
+                    " buf=" + std::to_string(bufferFrames);
         close(pcmFd);
         return true;
     }
 
-    unsigned long totalFramesOut = 0;
+    fprintf(
+        stderr,
+        "ACTIVE_PCM %s(%s) rate=%u ch=%u fmt=S16_LE p=%u buf=%u asrc=%d valFrames=%lu peak=%d nz=%lu route=%s\n",
+        devPath, devLabel.c_str(), actualRate, channels, periodFrames, bufferFrames,
+        useAsrc ? 1 : 0, totalValFrames, peakAbs, nonZeroStrong, routeInfo.c_str()
+    );
+    fflush(stderr);
+
+    unsigned long totalFramesOut = totalValFrames;
+    if (!stagingSamples.empty()) {
+        size_t stagedFrames = stagingSamples.size() / channels;
+        if (!writeConvertedFramesToStdout(
+                stagingSamples.data(), stagedFrames, actualRate, targetOutRate, channels, outBuf, totalFramesOut
+            )) {
+            close(pcmFd);
+            return true;
+        }
+    }
+
     while (true) {
         struct snd_xferi xfer {};
         xfer.buf = inBuf.data();
@@ -465,6 +707,7 @@ bool tryStreamSingleDevice(
             }
             detailMsg = std::string(devPath) + " readi=" + strerror(errno) + " frames=" + std::to_string(totalFramesOut);
             fprintf(stderr, "ERR %s\n", detailMsg.c_str());
+            fflush(stderr);
             close(pcmFd);
             return false;
         }
@@ -472,33 +715,10 @@ bool tryStreamSingleDevice(
 
         size_t inFrames = static_cast<size_t>(xfer.result);
         totalFramesOut += static_cast<unsigned long>(inFrames);
-        if (actualRate == targetOutRate || actualRate == 0) {
-            ssize_t written = write(STDOUT_FILENO, inBuf.data(), inFrames * frameBytes);
-            if (written <= 0) {
-                fprintf(stderr, "STDOUT_END frames=%lu errno=%d\n", totalFramesOut, errno);
-                break;
-            }
-        } else {
-            size_t outFrames = (inFrames * targetOutRate) / actualRate;
-            if (outFrames == 0) continue;
-            outBuf.resize(outFrames * channels);
-            for (size_t i = 0; i < outFrames; ++i) {
-                double srcPos = (static_cast<double>(i) * actualRate) / targetOutRate;
-                size_t idx0 = static_cast<size_t>(srcPos);
-                if (idx0 >= inFrames) idx0 = inFrames - 1;
-                size_t idx1 = (idx0 + 1 < inFrames) ? (idx0 + 1) : idx0;
-                double frac = srcPos - static_cast<double>(idx0);
-                for (unsigned int ch = 0; ch < channels; ++ch) {
-                    double s0 = static_cast<double>(inBuf[idx0 * channels + ch]);
-                    double s1 = static_cast<double>(inBuf[idx1 * channels + ch]);
-                    outBuf[i * channels + ch] = static_cast<int16_t>(s0 + (s1 - s0) * frac);
-                }
-            }
-            ssize_t written = write(STDOUT_FILENO, outBuf.data(), outFrames * frameBytes);
-            if (written <= 0) {
-                fprintf(stderr, "STDOUT_END frames=%lu errno=%d\n", totalFramesOut, errno);
-                break;
-            }
+        if (!writeConvertedFramesToStdout(
+                inBuf.data(), inFrames, actualRate, targetOutRate, channels, outBuf, totalFramesOut
+            )) {
+            break;
         }
     }
     close(pcmFd);
@@ -506,18 +726,14 @@ bool tryStreamSingleDevice(
 }
 
 std::string probeAllFmCandidates(unsigned int targetRate) {
-    struct Candidate { int card; int dev; unsigned int rate; bool asrc; };
-    const std::vector<Candidate> candidates = {
-        {0, 114, targetRate, false},
-        {0, 114, targetRate, true},
-        {0, 117, targetRate, false},
-        {0, 14, targetRate, false},
-        {0, 14, 40000, false}
-    };
+    const auto candidates = buildDynamicFmCandidates(targetRate);
+    if (candidates.empty()) {
+        return "no_card0_fm_capture_pcm_found";
+    }
     std::string summary;
     for (const auto& c : candidates) {
         std::string msg;
-        tryStreamSingleDevice(c.card, c.dev, c.rate, targetRate, 2, c.asrc, true, 450, msg);
+        tryStreamSingleDevice(c.card, c.dev, c.name, c.rate, targetRate, 2, c.asrc, true, 450, msg);
         if (!summary.empty()) summary += "; ";
         summary += msg;
     }
@@ -526,32 +742,25 @@ std::string probeAllFmCandidates(unsigned int targetRate) {
 }
 
 int runPcmCaptureStream(int card, int dev, unsigned int targetRate, unsigned int channels) {
-    struct Candidate { int card; int dev; unsigned int rate; bool asrc; };
-    std::vector<Candidate> candidates;
-    if (card == 0 && dev == 14) {
-        // Urutan prioritas Exynos 850 ABOX sesuai mixer_paths.xml route-fm (ASRC2=0 -> fallback ASRC2=1)
-        candidates = {
-            {0, 114, targetRate, false},
-            {0, 114, targetRate, true},
-            {0, 117, targetRate, false},
-            {0, 14, targetRate, false},
-            {0, 14, 40000, false}
-        };
-    } else {
-        candidates = { {card, dev, targetRate, false}, {card, dev, targetRate, true}, {card, dev, 40000, false} };
+    const auto candidates = buildDynamicFmCandidates(targetRate, card, dev);
+    if (candidates.empty()) {
+        fprintf(stderr, "ERR [no_card0_capture_candidates_in_proc_asound_pcm]\n");
+        fflush(stderr);
+        return 2;
     }
 
     std::string summary;
     for (const auto& c : candidates) {
         std::string reason;
-        if (tryStreamSingleDevice(c.card, c.dev, c.rate, targetRate, channels, c.asrc, false, 800, reason)) {
+        if (tryStreamSingleDevice(c.card, c.dev, c.name, c.rate, targetRate, channels, c.asrc, false, 800, reason)) {
             return 0;
         }
         if (!summary.empty()) summary += "; ";
         summary += reason;
     }
-    enableFmAlsaRoute(false, targetRate);
+    disableFmAlsaRoute();
     fprintf(stderr, "ERR [%s]\n", summary.c_str());
+    fflush(stderr);
     return 2;
 }
 #endif
@@ -673,39 +882,33 @@ int main(int argc, char** argv) {
             }
             std::cout << "OK" << std::endl;
         } else if (cmd == "DETECT_FM_PCM") {
-            FILE* fp = fopen("/proc/asound/pcm", "r");
-            if (!fp) {
-                std::cout << "NONE" << std::endl;
-                continue;
-            }
-            char buf[512];
-            int wdmaCard = -1, wdmaDev = -1;
-            int fmCard0 = -1, fmDev0 = -1;
-            while (fgets(buf, sizeof(buf), fp)) {
-                std::string lower = toLowerStr(buf);
-                if (lower.find("capture") == std::string::npos) continue;
-                int c = -1, d = -1;
-                if (sscanf(buf, "%d-%d:", &c, &d) != 2) continue;
-                // Hanya gunakan Card 0 (Exynos3830-Madera), JANGAN Card 2 (abox_dump)
-                if (c != 0) continue;
-                if (lower.find("wdma2") != std::string::npos && lower.find("dual") == std::string::npos) {
-                    wdmaCard = c;
-                    wdmaDev = d;
-                    break;
-                }
-                if (fmCard0 < 0 && (lower.find("fm") != std::string::npos || lower.find("spdy") != std::string::npos)) {
-                    fmCard0 = c;
-                    fmDev0 = d;
-                }
-            }
-            fclose(fp);
-            if (wdmaCard >= 0) {
-                std::cout << "OK " << wdmaCard << " " << wdmaDev << std::endl;
-            } else if (fmCard0 >= 0) {
-                std::cout << "OK " << fmCard0 << " " << fmDev0 << std::endl;
+#if HAS_ALSA_UAPI
+            const auto candidates = buildDynamicFmCandidates(48000);
+            if (!candidates.empty()) {
+                std::cout << "OK " << candidates[0].card << " " << candidates[0].dev
+                          << " " << candidates[0].name << std::endl;
             } else {
                 std::cout << "NONE" << std::endl;
             }
+#else
+            std::cout << "NONE" << std::endl;
+#endif
+        } else if (cmd == "LIST_PCM_CAPTURE") {
+#if HAS_ALSA_UAPI
+            const auto discovered = discoverCard0CapturePcms();
+            if (discovered.empty()) {
+                std::cout << "NONE" << std::endl;
+            } else {
+                std::ostringstream oss;
+                for (size_t i = 0; i < discovered.size(); ++i) {
+                    if (i > 0) oss << "; ";
+                    oss << discovered[i].card << "-" << discovered[i].dev << ":" << discovered[i].rawName;
+                }
+                std::cout << "OK " << oss.str() << std::endl;
+            }
+#else
+            std::cout << "NONE" << std::endl;
+#endif
         } else if (cmd == "ENABLE_FM_ALSA") {
 #if HAS_ALSA_UAPI
             std::cout << enableFmAlsaRoute(false, 48000) << std::endl;
@@ -721,7 +924,13 @@ int main(int argc, char** argv) {
 #endif
         } else if (cmd == "LIST_FM_CTLS") {
 #if HAS_ALSA_UAPI
-            listFmAlsaControls();
+            listFmAlsaControls(false);
+#else
+            std::cout << "ERR no_asound_h" << std::endl;
+#endif
+        } else if (cmd == "LIST_ALL_FM_CTLS") {
+#if HAS_ALSA_UAPI
+            listFmAlsaControls(true);
 #else
             std::cout << "ERR no_asound_h" << std::endl;
 #endif

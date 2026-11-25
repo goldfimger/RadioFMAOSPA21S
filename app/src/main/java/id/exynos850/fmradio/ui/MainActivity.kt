@@ -35,7 +35,9 @@ import id.exynos850.fmradio.data.FmStationEntity
 import id.exynos850.fmradio.data.StationJsonExporter
 import id.exynos850.fmradio.nativebridge.FmNativeTuner
 import id.exynos850.fmradio.nativebridge.HardwareSignalInfo
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -87,6 +89,7 @@ class MainActivity : ComponentActivity() {
         var lastErrorHistory by remember { mutableStateOf<String?>(null) }
         var diagnosticReport by remember { mutableStateOf<String?>(null) }
         var isRootActive by remember { mutableStateOf(false) }
+        var hasStartedPlayback by remember { mutableStateOf(false) }
 
         val activeStation = stations.firstOrNull { it.frequencyKhz == freqKhz }
 
@@ -134,15 +137,24 @@ class MainActivity : ComponentActivity() {
             }
             onDispose {
                 audioEngine.unregisterAntennaCallback(callback)
+                audioEngine.stopAudioStream("dispose")
             }
         }
 
         LaunchedEffect(isPlaying) {
             if (isPlaying) {
+                hasStartedPlayback = true
                 tunerError = null
                 diagnosticReport = null
                 fmTuner.logEvent("Play pressed freq=$freqKhz")
                 val opened = withContext(Dispatchers.IO) { fmTuner.open(allowRootFallback = true) }
+                if (!isActive || !isPlaying) {
+                    withContext(Dispatchers.IO + NonCancellable) {
+                        fmTuner.disableFmAudioRoute()
+                        fmTuner.close()
+                    }
+                    return@LaunchedEffect
+                }
                 if (opened) {
                     isRootActive = fmTuner.isUsingRootMode()
                     fmTuner.logEvent("Tuner opened root=$isRootActive")
@@ -153,6 +165,13 @@ class MainActivity : ComponentActivity() {
                         route to pcm
                     }
                     fmTuner.logEvent("Route=$alsaRouteStatus PCM=$rootFmPcm")
+                    if (!isActive || !isPlaying) {
+                        withContext(Dispatchers.IO + NonCancellable) {
+                            fmTuner.disableFmAudioRoute()
+                            fmTuner.close()
+                        }
+                        return@LaunchedEffect
+                    }
                     audioEngine.startAudioStream(
                         scope = lifecycleScope,
                         rootFmPcm = rootFmPcm,
@@ -163,6 +182,7 @@ class MainActivity : ComponentActivity() {
                         fmTuner.logEvent("AudioError: $err")
                         tunerError = err
                         lastErrorHistory = err
+                        isPlaying = false
                     }
                     while (isActive && isPlaying) {
                         signal = withContext(Dispatchers.IO) { fmTuner.readSignalMetrics() }
@@ -177,14 +197,15 @@ class MainActivity : ComponentActivity() {
                     diagnosticReport = fmTuner.getDiagnosticReport()
                     isPlaying = false
                 }
-            } else {
-                fmTuner.logEvent("Stopped playback")
+            } else if (hasStartedPlayback) {
+                fmTuner.logEvent("Stop requested -> stopping stream & route")
                 isRootActive = false
-                audioEngine.stopAudioStream()
-                withContext(Dispatchers.IO) {
+                audioEngine.stopAudioStream("user_or_error_stop")
+                withContext(Dispatchers.IO + NonCancellable) {
                     fmTuner.disableFmAudioRoute()
                     fmTuner.close()
                 }
+                fmTuner.logEvent("Cleanup complete")
             }
         }
 
@@ -647,7 +668,9 @@ class MainActivity : ComponentActivity() {
                                     .fillMaxWidth()
                                     .clickable {
                                         freqKhz = st.frequencyKhz
-                                        if (isPlaying) fmTuner.tuneManual(freqKhz)
+                                        if (isPlaying) {
+                                            lifecycleScope.launch(Dispatchers.IO) { fmTuner.tuneManual(st.frequencyKhz) }
+                                        }
                                     }
                                     .padding(horizontal = 20.dp, vertical = 12.dp),
                                 verticalAlignment = Alignment.CenterVertically,
@@ -725,8 +748,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        audioEngine.stopAudioStream()
-        fmTuner.close()
+        audioEngine.stopAudioStream("activity_destroy")
+        CoroutineScope(Dispatchers.IO).launch {
+            fmTuner.close()
+        }
         dbHelper.close()
     }
 }

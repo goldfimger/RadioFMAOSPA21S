@@ -25,12 +25,13 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
         }
     }
 
-    private var isOpen = false
-    private var usingRootDaemon = false
-    private var rootProc: Process? = null
-    private var rootWriter: BufferedWriter? = null
-    private var rootReader: BufferedReader? = null
-    private var rootLastError = ""
+    private val daemonLock = Any()
+    @Volatile private var isOpen = false
+    @Volatile private var usingRootDaemon = false
+    @Volatile private var rootProc: Process? = null
+    @Volatile private var rootWriter: BufferedWriter? = null
+    @Volatile private var rootReader: BufferedReader? = null
+    @Volatile private var rootLastError = ""
     private val eventLog = ArrayDeque<String>()
 
     @Synchronized
@@ -38,25 +39,27 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
         android.util.Log.i("A21sFm", msg)
         val ts = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US).format(java.util.Date())
         eventLog.addLast("$ts $msg")
-        while (eventLog.size > 40) eventLog.removeFirst()
+        while (eventLog.size > 60) eventLog.removeFirst()
     }
 
     @Synchronized
     fun getEventLogText(): String = if (eventLog.isEmpty()) "-" else eventLog.joinToString("\n")
 
-    @Synchronized
-    private fun rootCommand(cmd: String): String {
+    private fun rootCommand(cmd: String): String = synchronized(daemonLock) {
         val w = rootWriter ?: return "ERR no_writer"
         val r = rootReader ?: return "ERR no_reader"
-        return runCatching {
+        return try {
             w.write(cmd)
             w.newLine()
             w.flush()
             r.readLine() ?: "ERR eof"
-        }.getOrElse { "ERR ${it.message}" }
+        } catch (ex: Exception) {
+            logEvent("rootCommand($cmd) failed: ${ex.javaClass.simpleName}: ${ex.message}")
+            "ERR ${ex.message}"
+        }
     }
 
-    private fun openViaRootDaemon(): Boolean {
+    private fun openViaRootDaemon(): Boolean = synchronized(daemonLock) {
         if (nativeLibDir.isBlank()) {
             rootLastError = "nativeLibDir kosong."
             return false
@@ -66,7 +69,8 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
             rootLastError = "Helper root tidak ditemukan: ${binFile.absolutePath}"
             return false
         }
-        return runCatching {
+        closeRootDaemonLocked()
+        return try {
             val proc = ProcessBuilder("su", "-c", binFile.absolutePath)
                 .redirectErrorStream(true)
                 .start()
@@ -82,28 +86,46 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
                 true
             } else {
                 rootLastError = "Root daemon gagal membuka /dev/radio0: $resp"
-                closeRootDaemon()
+                closeRootDaemonLocked()
                 false
             }
-        }.getOrElse { ex ->
+        } catch (ex: Exception) {
             rootLastError = "Gagal menjalankan su (KSU/Magisk): ${ex.message}"
-            closeRootDaemon()
+            logEvent("openViaRootDaemon error: ${ex.message}")
+            closeRootDaemonLocked()
             false
         }
     }
 
-    private fun closeRootDaemon() {
-        runCatching { rootWriter?.write("CLOSE\n"); rootWriter?.flush() }
-        runCatching { rootWriter?.close() }
-        runCatching { rootReader?.close() }
-        runCatching { rootProc?.destroy() }
+    private fun closeRootDaemonLocked() {
+        try {
+            rootWriter?.write("CLOSE\n")
+            rootWriter?.flush()
+        } catch (ex: Exception) {
+            logEvent("rootDaemon CLOSE flush warning: ${ex.message}")
+        }
+        try {
+            rootWriter?.close()
+        } catch (_: Exception) {
+            // Stream already closed by child exit
+        }
+        try {
+            rootReader?.close()
+        } catch (_: Exception) {
+            // Stream already closed by child exit
+        }
+        try {
+            rootProc?.destroy()
+        } catch (ex: Exception) {
+            logEvent("rootProc destroy warning: ${ex.message}")
+        }
         rootWriter = null
         rootReader = null
         rootProc = null
         usingRootDaemon = false
     }
 
-    fun open(allowRootFallback: Boolean = true): Boolean {
+    fun open(allowRootFallback: Boolean = true): Boolean = synchronized(daemonLock) {
         if (isOpen) return true
         if (nativeOpenTuner()) {
             usingRootDaemon = false
@@ -119,12 +141,12 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
 
     fun isUsingRootMode(): Boolean = usingRootDaemon
 
-    fun close() {
-        if (!isOpen) return
+    fun close() = synchronized(daemonLock) {
+        if (!isOpen && rootProc == null) return
         if (usingRootDaemon) {
             rootCommand("MUTE 1")
             rootCommand("DISABLE_FM_ALSA")
-            closeRootDaemon()
+            closeRootDaemonLocked()
         } else {
             nativeSetMute(true)
             nativeCloseTuner()
@@ -206,11 +228,17 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
         return null
     }
 
+    fun listRootCapturePcms(): String {
+        if (!usingRootDaemon) return "Daemon root belum aktif"
+        return rootCommand("LIST_PCM_CAPTURE")
+    }
+
     suspend fun getRootAudioDiagnostic(
         packageName: String
     ): String = withContext(Dispatchers.IO) {
         val alsaCtls = if (usingRootDaemon) rootCommand("LIST_FM_CTLS") else "Daemon root belum aktif"
         val pcmDetect = if (usingRootDaemon) rootCommand("DETECT_FM_PCM") else "-"
+        val pcmCaptureList = if (usingRootDaemon) rootCommand("LIST_PCM_CAPTURE") else "-"
         runCatching {
             val script = """
                 echo "=== capture PCM Card 0 (/proc/asound/pcm) ==="
@@ -223,7 +251,7 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
                 .start()
             val out = proc.inputStream.bufferedReader().readText().trim()
             proc.waitFor()
-            val combined = "$out\n=== DETECT_FM_PCM ===\n$pcmDetect\n=== ALSA FM/SPDY/WDMA2 Controls ===\n$alsaCtls"
+            val combined = "$out\n=== DETECT_FM_PCM ===\n$pcmDetect\n=== LIST_PCM_CAPTURE ===\n$pcmCaptureList\n=== ALSA FM/SPDY/WDMA2 Controls ===\n$alsaCtls"
             combined.trim().ifBlank { "Tidak ada output diagnostik root." }
         }.getOrElse { ex ->
             "Gagal membaca diagnostik root: ${ex.message}"
@@ -238,17 +266,19 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
         val targetPath = "/sdcard/A21s_FM_BugReport.txt"
         val liveProbeOutput = if (usingRootDaemon) {
             val pcmDetect = rootCommand("DETECT_FM_PCM")
+            val pcmList = rootCommand("LIST_PCM_CAPTURE")
             val v4l2Ctls = rootCommand("LIST_V4L2_CTLS")
             val probeAudio = rootCommand("PROBE_FM_AUDIO")
-            val alsaCtls = rootCommand("LIST_FM_CTLS")
+            val alsaCtls = rootCommand("LIST_ALL_FM_CTLS")
             """
                 DETECT_FM_PCM: $pcmDetect
+                LIST_PCM_CAPTURE: $pcmList
                 PROBE_FM_AUDIO: $probeAudio
 
                 === V4L2 CONTROLS (/dev/radio0) ===
                 $v4l2Ctls
 
-                === ALSA CONTROLS (LIST_FM_CTLS) ===
+                === ALSA CONTROLS (LIST_ALL_FM_CTLS) ===
                 $alsaCtls
             """.trimIndent()
         } else {
@@ -256,7 +286,7 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
                 val bin = getRootDaemonBinaryPath()
                 val p = ProcessBuilder("su", "-c", bin).redirectErrorStream(true).start()
                 p.outputStream.bufferedWriter().use { w ->
-                    w.write("OPEN\nTUNE 98700\nLIST_V4L2_CTLS\nDETECT_FM_PCM\nPROBE_FM_AUDIO\nLIST_FM_CTLS\nCLOSE\n")
+                    w.write("OPEN\nTUNE 98700\nLIST_V4L2_CTLS\nDETECT_FM_PCM\nLIST_PCM_CAPTURE\nPROBE_FM_AUDIO\nLIST_ALL_FM_CTLS\nCLOSE\n")
                     w.flush()
                 }
                 val lines = p.inputStream.bufferedReader().readLines()
@@ -264,17 +294,19 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
                 val tuneResp = lines.getOrNull(1) ?: "-"
                 val v4l2Resp = lines.getOrNull(2) ?: "-"
                 val detectResp = lines.getOrNull(3) ?: "-"
-                val probeResp = lines.getOrNull(4) ?: "-"
-                val alsaResp = lines.getOrNull(5) ?: "-"
+                val pcmListResp = lines.getOrNull(4) ?: "-"
+                val probeResp = lines.getOrNull(5) ?: "-"
+                val alsaResp = lines.getOrNull(6) ?: "-"
                 """
                     OPEN: $openResp | TUNE(98700): $tuneResp
                     DETECT_FM_PCM: $detectResp
+                    LIST_PCM_CAPTURE: $pcmListResp
                     PROBE_FM_AUDIO: $probeResp
 
                     === V4L2 CONTROLS (/dev/radio0) ===
                     $v4l2Resp
 
-                    === ALSA CONTROLS (LIST_FM_CTLS) ===
+                    === ALSA CONTROLS (LIST_ALL_FM_CTLS) ===
                     $alsaResp
                 """.trimIndent()
             }.getOrElse { ex ->
@@ -290,6 +322,11 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
                 echo "Android: $(getprop ro.build.version.release) | SDK: $(getprop ro.build.version.sdk)"
                 echo "Kernel: $(uname -a)"
                 echo ""
+                echo "=== NATIVE DIAGNOSTIC ==="
+                cat <<'EOF'
+$nativeDiag
+EOF
+                echo ""
                 echo "=== MIXER PATHS (spdy/fm_radio/route-fm/wdma2) ==="
                 sed -n '1,120p' /vendor/etc/mixer_paths.xml 2>/dev/null || true
                 echo "---"
@@ -298,8 +335,11 @@ class FmNativeTuner(private val nativeLibDir: String = "") {
                 echo "=== AUDIO POLICY (fm/radio_tuner) ==="
                 grep -rn -C 3 -iE "fm_tuner|RADIO_TUNER|FM" /vendor/etc/audio_policy* 2>/dev/null | head -n 40 || true
                 echo ""
-                echo "=== DMESG (s610/fm/abox/spdy/wdma2) ==="
-                dmesg 2>/dev/null | grep -iE "s610|14ac0000|spdy|wdma2|abox|asrc|vpcm|vdma|fm_" | tail -n 160 || true
+                echo "=== DMESG (s610/14ac0000/mx250/wlbt) ==="
+                dmesg 2>/dev/null | grep -iE "s610|14ac0000|mx250|wlbt" | tail -n 80 || true
+                echo ""
+                echo "=== DMESG (abox/spdy/wdma2/asrc/vpcm) ==="
+                dmesg 2>/dev/null | grep -iE "spdy|wdma2|abox|asrc|vpcm|vdma|fm_" | tail -n 140 || true
                 echo ""
                 echo "=== LOGCAT (Audio/FM) ==="
                 logcat -d -t 200 2>/dev/null | grep -iE "A21sFm|AudioTrack|AudioFlinger|audio_hw|fm_" | tail -n 80 || true
